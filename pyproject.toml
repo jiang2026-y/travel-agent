@@ -1,0 +1,33 @@
+[project]
+name = "travel-agent-workspace"
+version = "0.1.0"
+description = "企业级智能旅行助手的开发工作区"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv.workspace]
+members = [
+  "packages/sensitive-masker",
+  "services/api-server",
+  "services/agent-server",
+  "services/tool-gateway",
+]
+
+[dependency-groups]
+dev = [
+  "jsonschema>=4.23,<5",
+  "mypy>=1.18,<2",
+  "pyyaml>=6.0,<7",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "ruff>=0.14,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["services/api-server/tests", "services/agent-server/tests", "services/tool-gateway/tests"]
+addopts = ["--import-mode=importlib"]
+pythonpath = [
+  "services/api-server/src",
+  "services/agent-server/src",
+  "services/tool-gateway/src",
+]

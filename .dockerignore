@@ -1,0 +1,12 @@
+# 本文件定义 Docker 构建上下文排除项；不定义函数或类。
+.git
+.venv
+node_modules
+apps/web/node_modules
+apps/web/dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.local
+docker/data

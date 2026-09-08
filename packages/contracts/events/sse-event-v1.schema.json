@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://travel-agent.local/contracts/events/sse-event-v1.schema.json",
+  "title": "旅行助手浏览器 SSE 事件 v1",
+  "description": "仅包含面向用户的脱敏事件；禁止携带认证凭据、提示词或私有推理。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "run_id", "timestamp", "type", "data", "trace_id"],
+  "properties": {
+    "event_id": { "$ref": "#/$defs/Identifier" },
+    "run_id": { "$ref": "#/$defs/Identifier" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "type": {
+      "enum": [
+        "run_started",
+        "intent_recognized",
+        "progress",
+        "token",
+        "clarification_required",
+        "tool_status",
+        "plan_proposed",
+        "approval_required",
+        "recommendations",
+        "error",
+        "run_completed"
+      ]
+    },
+    "data": { "type": "object" },
+    "trace_id": { "$ref": "#/$defs/Identifier" }
+  },
+  "allOf": [
+    { "if": { "properties": { "type": { "const": "run_started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/RunStarted" } } } },
+    { "if": { "properties": { "type": { "const": "intent_recognized" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/IntentRecognized" } } } },
+    { "if": { "properties": { "type": { "const": "progress" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/Progress" } } } },
+    { "if": { "properties": { "type": { "const": "token" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/Token" } } } },
+    { "if": { "properties": { "type": { "const": "clarification_required" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/Clarification" } } } },
+    { "if": { "properties": { "type": { "const": "tool_status" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/ToolStatus" } } } },
+    { "if": { "properties": { "type": { "const": "plan_proposed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/PlanProposed" } } } },
+    { "if": { "properties": { "type": { "const": "approval_required" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/ApprovalRequired" } } } },
+    { "if": { "properties": { "type": { "const": "recommendations" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/Recommendations" } } } },
+    { "if": { "properties": { "type": { "const": "error" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/Error" } } } },
+    { "if": { "properties": { "type": { "const": "run_completed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/RunCompleted" } } } }
+  ],
+  "$defs": {
+    "Identifier": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+    "RunStarted": { "type": "object", "additionalProperties": false, "required": ["conversation_id", "status"], "properties": { "conversation_id": { "$ref": "#/$defs/Identifier" }, "status": { "type": "string", "minLength": 1, "maxLength": 64 } } },
+    "IntentRecognized": { "type": "object", "additionalProperties": false, "required": ["source", "intent_summary", "confidence", "missing_slots"], "properties": { "source": { "enum": ["L0", "RULE", "VECTOR", "LLM"] }, "intent_summary": { "type": "string", "minLength": 1, "maxLength": 500 }, "confidence": { "type": "number", "minimum": 0, "maximum": 1 }, "missing_slots": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 100 } } } },
+    "Progress": { "type": "object", "additionalProperties": false, "required": ["stage_code", "message"], "properties": { "stage_code": { "type": "string", "pattern": "^[A-Z0-9_]{1,64}$" }, "message": { "type": "string", "minLength": 1, "maxLength": 500 } } },
+    "Token": { "type": "object", "additionalProperties": false, "required": ["text"], "properties": { "text": { "type": "string", "minLength": 1, "maxLength": 4000 } } },
+    "Clarification": { "type": "object", "additionalProperties": false, "required": ["questions", "reason"], "properties": { "questions": { "type": "array", "minItems": 1, "maxItems": 3, "items": { "type": "string", "minLength": 1, "maxLength": 500 } }, "reason": { "type": "string", "minLength": 1, "maxLength": 500 } } },
+    "ToolStatus": { "type": "object", "additionalProperties": false, "required": ["skill_name", "status", "summary"], "properties": { "skill_name": { "type": "string", "maxLength": 100 }, "status": { "enum": ["started", "completed", "failed", "denied"] }, "summary": { "type": "string", "maxLength": 500 } } },
+    "PlanProposed": { "type": "object", "additionalProperties": false, "required": ["plan_id", "options", "assumptions"], "properties": { "plan_id": { "$ref": "#/$defs/Identifier" }, "options": { "type": "array", "maxItems": 10, "items": { "type": "object" } }, "assumptions": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 500 } } } },
+    "ApprovalRequired": { "type": "object", "additionalProperties": false, "required": ["action_summary", "allowed_decisions"], "properties": { "action_summary": { "type": "string", "maxLength": 500 }, "allowed_decisions": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "enum": ["approve", "reject", "edit", "timeout"] } } } },
+    "Recommendations": { "type": "object", "additionalProperties": false, "required": ["items"], "properties": { "items": { "type": "array", "maxItems": 10, "items": { "type": "string", "maxLength": 500 } } } },
+    "Error": { "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string", "pattern": "^[a-z0-9_]{1,100}$" }, "message": { "type": "string", "maxLength": 500 }, "retryable": { "type": "boolean" } } },
+    "RunCompleted": { "type": "object", "additionalProperties": false, "required": ["status", "result_ref"], "properties": { "status": { "enum": ["completed", "cancelled", "failed"] }, "result_ref": { "$ref": "#/$defs/Identifier" } } }
+  }
+}

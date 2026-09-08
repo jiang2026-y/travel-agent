@@ -1,0 +1,48 @@
+/* 本文件定义前端开发骨架的全局样式；不定义函数或类。 */
+
+:root {
+  color: #1f1f1f;
+  background: #f5f7fa;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-header {
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.logout-button {
+  float: right;
+  margin-top: 16px;
+}
+
+.app-content {
+  margin: 48px auto;
+  width: min(880px, calc(100% - 32px));
+}
+
+.login-page,
+.page-loading {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 16px;
+}
+
+.login-card {
+  width: min(420px, 100%);
+}
+
+.full-width {
+  width: 100%;
+}

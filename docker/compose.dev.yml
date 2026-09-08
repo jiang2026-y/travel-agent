@@ -1,0 +1,236 @@
+# 本文件编排本地 real_readonly 开发运行单元；启动 Web、API、Agent、Tool Gateway、PostgreSQL、Redis 和一次性数据库迁移，不接入真实外部写能力。
+
+name: travel-agent-dev
+
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: docker/web.Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      api-server:
+        condition: service_healthy
+    volumes:
+      - ../apps/web:/workspace/apps/web
+      - web_node_modules:/workspace/apps/web/node_modules
+    networks:
+      - edge-network
+
+  api-server:
+    build:
+      context: ..
+      dockerfile: docker/api-server.Dockerfile
+    environment:
+      TRAVEL_AGENT_ENV: development
+      TRAVEL_AGENT_EXTERNAL_MODE: real_readonly
+      AGENT_SERVER_BASE_URL: http://agent-server:8001
+      API_AGENT_INTERNAL_TOKEN_FILE: /run/secrets/api_agent_internal_token
+      DATABASE_URL: postgresql+asyncpg://travel_agent_dev:local_development_only@postgres:5432/travel_agent_dev
+      DATABASE_MIGRATION_URL: postgresql+psycopg://travel_agent_dev:local_development_only@postgres:5432/travel_agent_dev
+      TRAVEL_AGENT_DATA_ENCRYPTION_KEY_FILE: /run/secrets/data_encryption_key
+      TRAVEL_AGENT_PERSISTENCE_ENABLED: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      agent-server:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - edge-network
+      - backend-network
+    secrets:
+      - api_agent_internal_token
+      - data_encryption_key
+
+  db-migrate:
+    build:
+      context: ..
+      dockerfile: docker/api-server.Dockerfile
+    environment:
+      DATABASE_MIGRATION_URL: postgresql+psycopg://travel_agent_dev:local_development_only@postgres:5432/travel_agent_dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "-c", "migrations/api-server/alembic.ini", "upgrade", "head"]
+    restart: "no"
+    networks:
+      - backend-network
+
+  agent-server:
+    build:
+      context: ..
+      dockerfile: docker/agent-server.Dockerfile
+    environment:
+      TRAVEL_AGENT_ENV: development
+      TRAVEL_AGENT_EXTERNAL_MODE: real_readonly
+      TOOL_GATEWAY_BASE_URL: http://tool-gateway:8002
+      API_SERVER_BASE_URL: http://api-server:8000
+      TRAVEL_AGENT_REDIS_URL: redis://redis:6379/0
+      TRAVEL_AGENT_CHECKPOINT_TTL_SECONDS: "604800"
+      TRAVEL_AGENT_HITL_TOKEN_TTL_SECONDS: "900"
+      API_AGENT_INTERNAL_TOKEN_FILE: /run/secrets/api_agent_internal_token
+      AGENT_GATEWAY_INTERNAL_TOKEN_FILE: /run/secrets/agent_gateway_internal_token
+      TRAVEL_AGENT_DATA_ENCRYPTION_KEY_FILE: /run/secrets/data_encryption_key
+      TRAVEL_AGENT_PROVIDER_KEY: dashscope
+      TRAVEL_AGENT_PROVIDER_VERSION: intent-v1
+      TRAVEL_AGENT_PROVIDER_BASE_URL: https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+      TRAVEL_AGENT_PROVIDER_SECRET_REF: dashscope_api_key
+      TRAVEL_AGENT_PROVIDER_APPROVED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      tool-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - backend-network
+      - tool-gateway-network
+    secrets:
+      - api_agent_internal_token
+      - agent_gateway_internal_token
+      - data_encryption_key
+
+  tool-gateway:
+    build:
+      context: ..
+      dockerfile: docker/tool-gateway.Dockerfile
+    environment:
+      TRAVEL_AGENT_ENV: development
+      TRAVEL_AGENT_EXTERNAL_MODE: real_readonly
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: localhost,127.0.0.1,tool-gateway,egress-proxy
+      DASHSCOPE_BASE_URL: https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+      DASHSCOPE_API_KEY_FILE: /run/secrets/dashscope_api_key
+      AGENT_GATEWAY_INTERNAL_TOKEN_FILE: /run/secrets/agent_gateway_internal_token
+    expose:
+      - "8002"
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - tool-gateway-network
+    secrets:
+      - dashscope_api_key
+      - agent_gateway_internal_token
+
+  egress-proxy:
+    build:
+      context: ..
+      dockerfile: docker/egress-proxy.Dockerfile
+    expose:
+      - "3128"
+    read_only: true
+    tmpfs:
+      - /var/cache/squid:rw,noexec,nosuid,nodev,size=32m
+      - /var/log/squid:rw,noexec,nosuid,nodev,size=8m
+      - /run:rw,noexec,nosuid,nodev,size=4m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /etc/squid/squid.conf"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - tool-gateway-network
+      - egress-network
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: travel_agent_dev
+      POSTGRES_USER: travel_agent_dev
+      POSTGRES_PASSWORD: local_development_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U travel_agent_dev -d travel_agent_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend-network
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - backend-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  web_node_modules:
+
+secrets:
+  api_agent_internal_token:
+    file: ../.secrets/api_agent_internal_token
+  data_encryption_key:
+    file: ../.secrets/data_encryption_key
+  agent_gateway_internal_token:
+    file: ../.secrets/agent_gateway_internal_token
+  dashscope_api_key:
+    file: ../.secrets/dashscope_api_key
+
+networks:
+  edge-network:
+  backend-network:
+    internal: true
+  tool-gateway-network:
+    internal: true
+  egress-network:

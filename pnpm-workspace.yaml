@@ -1,0 +1,6 @@
+packages:
+  - "apps/*"
+
+# 仅允许 Vite 必需的 esbuild 执行安装脚本；新增条目必须经安全评审确认。
+onlyBuiltDependencies:
+  - esbuild

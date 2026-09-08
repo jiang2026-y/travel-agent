@@ -1,0 +1,6 @@
+target-version = "py312"
+line-length = 100
+src = ["services/api-server/src", "services/agent-server/src", "services/tool-gateway/src"]
+
+[lint]
+select = ["E", "F", "I", "UP"]

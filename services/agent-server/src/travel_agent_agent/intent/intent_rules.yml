@@ -1,0 +1,56 @@
+# 本文件保存 L1 意图识别规则；rules 列表顺序即匹配优先级。
+# 每项定义 id、intent、正向正则与可选排除正则，供 RuleMatcher 读取并执行全文匹配。
+rules:
+  - id: greeting
+    intent: greeting
+    pattern: '^(?:你好|您好|哈喽|嗨|早上好|上午好|中午好|下午好|晚上好|在吗|请问)(?:[，,！!。？?\s]+(?:你好|您好|哈喽|嗨|早上好|上午好|中午好|下午好|晚上好|在吗|请问))*[！!。？?\s]*$'
+  - id: reimbursement
+    intent: reimbursement
+    pattern: '报销|发票|贴票|差旅报销|费用报销|提交报销'
+    exclude_pattern: '政策|标准|额度|能不能报|怎么报'
+  - id: policy_query
+    intent: policy_query
+    pattern: '差旅政策|报销政策|差标|超标|餐标|住宿标准|签证|出差规定|入境政策'
+  - id: approval_query
+    intent: approval_query
+    pattern: '审批进度|审批状态|批了吗|谁.*审批|审批到哪|通过了没'
+  - id: travel_cancel
+    intent: travel_cancel
+    pattern: '取消出差|撤回申请|不去了|出差取消|撤销.*出差'
+  - id: travel_modify
+    intent: travel_modify
+    pattern: '修改.*差旅|改期|延期|把.*日期.*改|改一下日期|修改目的地|出差时间变了'
+    exclude_pattern: '取消|撤回|撤销'
+  - id: travel_order_query
+    intent: travel_order_query
+    pattern: '差旅单|出差记录|我的差旅|差旅安排'
+    exclude_pattern: '提交|新建|取消|规划|报销|方案'
+  - id: attractions_query
+    intent: attractions_query
+    pattern: '景点|有什么好玩|打卡|必去|美食推荐|特产'
+  - id: general_info
+    intent: general_info
+    pattern: '天气|气温|限行|堵不堵|怎么走|时差|汇率|怎么去机场'
+    exclude_pattern: '机票|航班|火车票|订|预订|报销'
+  - id: itinerary_planning
+    intent: itinerary_planning
+    pattern: '规划.*行程|安排.*行程|行程方案|帮我规划|怎么排'
+  - id: flight_search
+    intent: flight_search
+    pattern: '查机票|航班|头等舱|直飞|往返机票'
+    exclude_pattern: '发票|报销|标准|政策|取消|退票|改签|预订'
+  - id: train_search
+    intent: train_search
+    pattern: '高铁|火车票|动车|列车|商务座'
+    exclude_pattern: '标准|政策|取消|退票|改签|预订'
+  - id: hotel_search
+    intent: hotel_search
+    pattern: '查酒店|住哪里|大床房|标间'
+    exclude_pattern: '标准|政策|报销|取消|退订|预订'
+  - id: booking
+    intent: booking
+    pattern: '预订|下单|就订这个|帮我订下|改签|退票|退订'
+  - id: travel_application
+    intent: travel_application
+    pattern: '申请出差|我要出差|帮我提.*申请|报备出差'
+    exclude_pattern: '审批进度|审批状态|取消|查|规划|报销'

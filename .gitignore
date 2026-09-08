@@ -1,0 +1,28 @@
+# Python 开发环境与测试产物
+.venv/
+__pycache__/
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+
+# 前端依赖与构建产物
+node_modules/
+apps/web/dist/
+*.tsbuildinfo
+
+# 本地环境变量与编辑器文件
+.env
+.env.local
+!.env.example
+.idea/
+.vscode/
+
+# Docker 本地持久化数据与日志
+docker/data/
+*.log
+
+# Docker Compose 本地服务间密钥；仅在本机生成，不纳入版本控制
+.secrets/*
+!.secrets/README.md

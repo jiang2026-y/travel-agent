@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://travel-agent.local/contracts/commands/agent-command-v1.schema.json",
+  "title": "旅行助手 API 到 Agent 内部命令 v1",
+  "description": "仅供受 Docker Secret 认证的 API Server 调用；浏览器不得直接调用。suspend_user_memory 为非 P0 账户生命周期技术预留，当前没有浏览器或 P0 API 入口。",
+  "oneOf": [
+    { "$ref": "#/$defs/StartCommand" },
+    { "$ref": "#/$defs/ResumeCommand" },
+    { "$ref": "#/$defs/CancelCommand" },
+    { "$ref": "#/$defs/SuspendUserMemoryCommand" }
+  ],
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,128}$"
+    },
+    "UserContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "role", "privacy_status"],
+      "properties": {
+        "user_id": { "$ref": "#/$defs/Identifier" },
+        "role": { "enum": ["user", "admin"] },
+        "privacy_status": { "enum": ["active", "deletion_pending", "deleted"] }
+      }
+    },
+    "RunContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversation_id", "run_id", "thread_id"],
+      "properties": {
+        "conversation_id": { "$ref": "#/$defs/Identifier" },
+        "run_id": { "$ref": "#/$defs/Identifier" },
+        "thread_id": { "$ref": "#/$defs/Identifier" }
+      }
+    },
+    "CommandBase": {
+      "type": "object",
+      "required": ["command_version", "request_id", "trace_id", "user"],
+      "properties": {
+        "command_version": { "const": "v1" },
+        "request_id": { "$ref": "#/$defs/Identifier" },
+        "trace_id": { "$ref": "#/$defs/Identifier" },
+        "user": { "$ref": "#/$defs/UserContext" }
+      }
+    },
+    "StartCommand": {
+      "allOf": [
+        { "$ref": "#/$defs/CommandBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "conversation_id", "run_id", "thread_id", "task_brief", "context_summary"],
+          "properties": {
+            "command_version": { "const": "v1" },
+            "request_id": { "$ref": "#/$defs/Identifier" },
+            "trace_id": { "$ref": "#/$defs/Identifier" },
+            "user": { "$ref": "#/$defs/UserContext" },
+            "command": { "const": "start" },
+            "conversation_id": { "$ref": "#/$defs/Identifier" },
+            "run_id": { "$ref": "#/$defs/Identifier" },
+            "thread_id": { "$ref": "#/$defs/Identifier" },
+            "task_brief": { "type": "string", "minLength": 1, "maxLength": 8000 },
+            "context_summary": { "type": "string", "maxLength": 2000 }
+          }
+        }
+      ]
+    },
+    "ResumeCommand": {
+      "allOf": [
+        { "$ref": "#/$defs/CommandBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "conversation_id", "run_id", "thread_id", "task_brief", "context_summary"],
+          "properties": {
+            "command_version": { "const": "v1" },
+            "request_id": { "$ref": "#/$defs/Identifier" },
+            "trace_id": { "$ref": "#/$defs/Identifier" },
+            "user": { "$ref": "#/$defs/UserContext" },
+            "command": { "const": "resume" },
+            "conversation_id": { "$ref": "#/$defs/Identifier" },
+            "run_id": { "$ref": "#/$defs/Identifier" },
+            "thread_id": { "$ref": "#/$defs/Identifier" },
+            "task_brief": { "type": "string", "minLength": 1, "maxLength": 8000 },
+            "context_summary": { "type": "string", "maxLength": 2000 }
+          }
+        }
+      ]
+    },
+    "CancelCommand": {
+      "allOf": [
+        { "$ref": "#/$defs/CommandBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "conversation_id", "run_id", "thread_id"],
+          "properties": {
+            "command_version": { "const": "v1" },
+            "request_id": { "$ref": "#/$defs/Identifier" },
+            "trace_id": { "$ref": "#/$defs/Identifier" },
+            "user": { "$ref": "#/$defs/UserContext" },
+            "command": { "const": "cancel" },
+            "conversation_id": { "$ref": "#/$defs/Identifier" },
+            "run_id": { "$ref": "#/$defs/Identifier" },
+            "thread_id": { "$ref": "#/$defs/Identifier" }
+          }
+        }
+      ]
+    },
+    "SuspendUserMemoryCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_version",
+        "command",
+        "request_id",
+        "trace_id",
+        "user",
+        "reason"
+      ],
+      "properties": {
+        "command_version": { "const": "v1" },
+        "command": { "const": "suspend_user_memory" },
+        "request_id": { "$ref": "#/$defs/Identifier" },
+        "trace_id": { "$ref": "#/$defs/Identifier" },
+        "user": {
+          "allOf": [
+            { "$ref": "#/$defs/UserContext" },
+            {
+              "properties": {
+                "privacy_status": { "enum": ["deletion_pending", "deleted"] }
+              }
+            }
+          ]
+        },
+        "reason": { "enum": ["account_deletion_requested", "account_deleted"] }
+      }
+    }
+  }
+}
