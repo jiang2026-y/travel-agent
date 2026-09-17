@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import jsonschema
+import pytest
 import yaml
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
@@ -62,6 +63,46 @@ def test_sse_schema_rejects_sensitive_or_unknown_event_data() -> None:
         pass
     else:
         raise AssertionError("SSE Schema 必须拒绝未知或敏感事件字段")
+
+
+def test_sse_schema_accepts_conversation_title_event() -> None:
+    """会话标题事件必须只携带标题文本，并拒绝额外字段。"""
+    schema = _load_json_schema("events/sse-event-v1.schema.json")
+    valid_event = {
+        "event_id": "title_001",
+        "run_id": "run_001",
+        "timestamp": "2026-09-16T12:00:00Z",
+        "type": "conversation_title",
+        "data": {"title": "上海出差申请"},
+        "trace_id": "trace_001",
+    }
+    jsonschema.validate(valid_event, schema)
+    assert "conversation_title" in schema["properties"]["type"]["enum"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {**valid_event, "data": {"title": "上海出差申请", "user_question": "不应出现"}},
+            schema,
+        )
+
+
+def test_sse_schema_accepts_interrupted_event() -> None:
+    """中断事件必须只携带状态与原因，并拒绝未知字段。"""
+    schema = _load_json_schema("events/sse-event-v1.schema.json")
+    valid_event = {
+        "event_id": "intr_001",
+        "run_id": "run_001",
+        "timestamp": "2026-09-16T12:00:00Z",
+        "type": "interrupted",
+        "data": {"status": "cancelled", "reason": "user_interrupted"},
+        "trace_id": "trace_001",
+    }
+    jsonschema.validate(valid_event, schema)
+    assert "interrupted" in schema["properties"]["type"]["enum"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {**valid_event, "data": {"status": "cancelled", "raw_prompt": "不应出现"}},
+            schema,
+        )
 
 
 def test_openapi_declares_preprovisioned_account_login_boundary() -> None:

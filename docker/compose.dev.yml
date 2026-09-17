@@ -24,8 +24,14 @@ services:
       dockerfile: docker/api-server.Dockerfile
     environment:
       TRAVEL_AGENT_ENV: development
-      TRAVEL_AGENT_EXTERNAL_MODE: real_readonly
+      TRAVEL_AGENT_EXTERNAL_MODE: real_tuniu
+      TRAVEL_AGENT_TUNIU_APPROVED: "true"
+      # 百炼 Retrieve 已配置；API Server 仅用于能力清单展示，不读取 AccessKey。
+      BAILIAN_ENABLED: "true"
+      BAILIAN_CONFIGURED: "true"
+      TUNIU_PROVIDER_CONFIGURED: "true"
       AGENT_SERVER_BASE_URL: http://agent-server:8001
+      TRAVEL_AGENT_RUN_COMMAND_TIMEOUT_SECONDS: "600"
       API_AGENT_INTERNAL_TOKEN_FILE: /run/secrets/api_agent_internal_token
       DATABASE_URL: postgresql+asyncpg://travel_agent_dev:local_development_only@postgres:5432/travel_agent_dev
       DATABASE_MIGRATION_URL: postgresql+psycopg://travel_agent_dev:local_development_only@postgres:5432/travel_agent_dev
@@ -75,7 +81,7 @@ services:
       dockerfile: docker/agent-server.Dockerfile
     environment:
       TRAVEL_AGENT_ENV: development
-      TRAVEL_AGENT_EXTERNAL_MODE: real_readonly
+      TRAVEL_AGENT_EXTERNAL_MODE: real_tuniu
       TOOL_GATEWAY_BASE_URL: http://tool-gateway:8002
       API_SERVER_BASE_URL: http://api-server:8000
       TRAVEL_AGENT_REDIS_URL: redis://redis:6379/0
@@ -89,6 +95,12 @@ services:
       TRAVEL_AGENT_PROVIDER_BASE_URL: https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
       TRAVEL_AGENT_PROVIDER_SECRET_REF: dashscope_api_key
       TRAVEL_AGENT_PROVIDER_APPROVED: "true"
+      TUNIU_API_KEY_FILE: /run/secrets/tuniu_api_key
+      TRAVEL_AGENT_TUNIU_APPROVED: "true"
+      # 工具熔断：连续失败 3 次进入冷却（60s 起、指数退避至 600s），半开探测成功即恢复。
+      TRAVEL_AGENT_TOOL_CIRCUIT_BREAKER_ENABLED: "true"
+      # 如只需 Java 默认的两项，改回 "query_weather,query_destination_news" 即可。
+      TRAVEL_AGENT_TOOL_CIRCUIT_MONITORED_TOOLS: "query_weather,query_destination_news,quick_visa_check,check_visa_requirement"
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,10 +119,14 @@ services:
     networks:
       - backend-network
       - tool-gateway-network
+      # 途牛 CLI 需要公网出口；缺少该网络时容器内 DNS 会解析失败，
+      # 查询、下单与取消都会以 tuniu_provider_call_failed 降级。
+      - egress-network
     secrets:
       - api_agent_internal_token
       - agent_gateway_internal_token
       - data_encryption_key
+      - tuniu_api_key
 
   tool-gateway:
     build:
@@ -124,7 +140,20 @@ services:
       NO_PROXY: localhost,127.0.0.1,tool-gateway,egress-proxy
       DASHSCOPE_BASE_URL: https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
       DASHSCOPE_API_KEY_FILE: /run/secrets/dashscope_api_key
+      BAILIAN_WORKSPACE_ID: ws-afyh9lpghkjx1iz8
+      BAILIAN_INDEX_ID: file_921c201ec9854ef3a3e8c999c5867f15_16035326
+      BAILIAN_ACCESS_KEY_ID_FILE: /run/secrets/bailian_access_key_id
+      BAILIAN_ACCESS_KEY_SECRET_FILE: /run/secrets/bailian_access_key_secret
+      # AccessKey 仅通过 Docker Secret 挂载到 Tool Gateway。
+      BAILIAN_ENABLED: "true"
       AGENT_GATEWAY_INTERNAL_TOKEN_FILE: /run/secrets/agent_gateway_internal_token
+      # 以下能力均为可选：Secret 文件缺失时对应工具自动降级，不影响主流程。
+      NEWSDATA_API_KEY_FILE: /run/secrets/newsdata_api_key
+      WEATHER_MCP_ENDPOINT_FILE: /run/secrets/weather_mcp_endpoint
+      ORIZN_VISA_API_KEY_FILE: /run/secrets/orizn_visa_api_key
+      BAILIAN_MEMORY_LIBRARY_ID_FILE: /run/secrets/bailian_memory_library_id
+      BAILIAN_MEMORY_PROJECT_ID_FILE: /run/secrets/bailian_project_id
+      BAILIAN_MEMORY_PROFILE_SCHEMA_FILE: /run/secrets/bailian_profile_schema
     expose:
       - "8002"
     depends_on:
@@ -151,6 +180,14 @@ services:
     secrets:
       - dashscope_api_key
       - agent_gateway_internal_token
+      - bailian_access_key_id
+      - bailian_access_key_secret
+      # 长期记忆只需记忆库 ID 与 DashScope Key；未创建该文件时记忆能力自动降级。
+      - bailian_memory_library_id
+      - bailian_profile_schema
+      - orizn_visa_api_key
+      # 目的地资讯 Key；文件缺失即视为未配置，工具返回未启用降级。
+      - newsdata_api_key
 
   egress-proxy:
     build:
@@ -226,6 +263,20 @@ secrets:
     file: ../.secrets/agent_gateway_internal_token
   dashscope_api_key:
     file: ../.secrets/dashscope_api_key
+  tuniu_api_key:
+    file: ../.secrets/tuniu_api_key
+  bailian_access_key_id:
+    file: ../.secrets/bailian_access_key_id
+  bailian_access_key_secret:
+    file: ../.secrets/bailian_access_key_secret
+  bailian_memory_library_id:
+    file: ../.secrets/bailian_memory_library_id
+  bailian_profile_schema:
+    file: ../.secrets/bailian_profile_schema
+  orizn_visa_api_key:
+    file: ../.secrets/orizn_visa_api_key
+  newsdata_api_key:
+    file: ../.secrets/newsdata_api_key
 
 networks:
   edge-network:

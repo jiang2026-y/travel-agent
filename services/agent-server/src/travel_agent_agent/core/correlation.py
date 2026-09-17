@@ -14,7 +14,9 @@ from typing import cast
 from starlette.requests import Request
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_ACTIVE_CONTEXT: ContextVar[CorrelationContext | None] = ContextVar("agent_correlation", default=None)
+_ACTIVE_CONTEXT: ContextVar[CorrelationContext | None] = ContextVar(
+    "agent_correlation", default=None
+)
 
 
 @dataclass(frozen=True, slots=True)

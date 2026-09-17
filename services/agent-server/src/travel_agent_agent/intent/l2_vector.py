@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from travel_agent_agent.intent.catalog import get_intent_definition
 from travel_agent_agent.intent.result import IntentRecognitionResult

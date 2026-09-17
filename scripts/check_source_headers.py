@@ -16,7 +16,8 @@ _DEFAULT_SOURCE_DIRECTORIES = ("apps/web/src", "services")
 
 def iter_source_files(project_root: Path, source_directories: Iterable[Path]) -> Iterable[Path]:
     """枚举前端和服务端源码，跳过缓存、构建产物与第三方依赖目录。"""
-    ignored_directories = {"__pycache__", "node_modules", "dist", ".venv"}
+    # skills 目录是从参考项目原样拷贝的第三方技能资产，不要求中文职责注释。
+    ignored_directories = {"__pycache__", "node_modules", "dist", ".venv", "skills"}
     for source_directory in source_directories:
         if not source_directory.exists():
             continue

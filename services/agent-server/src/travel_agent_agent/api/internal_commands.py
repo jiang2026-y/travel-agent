@@ -3,16 +3,25 @@
 # 定义 Docker Secret 认证、路由注册和二次身份校验函数。
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
 import secrets
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from pydantic import BaseModel, ConfigDict, Field
 from redis.exceptions import RedisError
+from travel_agent_sensitive_masker import SensitiveMasker
 
 from travel_agent_agent.agents.base import AgentContext
+from travel_agent_agent.agents.common.context_efficiency import (
+    bind_token_usage,
+    reset_token_usage,
+)
 from travel_agent_agent.agents.intent_recognition import IntentRecognitionAgent
 from travel_agent_agent.agents.itinerary_manage.hitl_context import (
     ToolExecutionAuthorization,
@@ -23,10 +32,21 @@ from travel_agent_agent.agents.master.agent import MasterAgent
 from travel_agent_agent.api.errors import ServiceError
 from travel_agent_agent.core.correlation import get_correlation_context
 from travel_agent_agent.core.settings import Settings
+from travel_agent_agent.intent.result import (
+    IntentConfidence,
+    IntentRecognitionResult,
+    IntentSource,
+    RecognizedIntent,
+)
 from travel_agent_agent.orchestration.checkpoints import (
     CheckpointError,
     RunCheckpoint,
     RunCheckpointStore,
+)
+from travel_agent_agent.orchestration.execution import (
+    RunExecution,
+    RunExecutionRegistry,
+    RunInterruptCoordinator,
 )
 from travel_agent_agent.orchestration.interactions import (
     InteractionError,
@@ -36,6 +56,20 @@ from travel_agent_agent.orchestration.interactions import (
 )
 from travel_agent_agent.orchestration.routing import RouteAction, RunRoute, route_from_recognition
 from travel_agent_agent.orchestration.status import RunStatus
+from travel_agent_agent.preferences.agent import PreferenceParseAgent
+from travel_agent_agent.recommendation.events import (
+    RecommendationEventError,
+    RecommendationEventStore,
+)
+from travel_agent_agent.recommendation.signals import continuation_signals
+from travel_agent_agent.title.agent import ConversationTitleAgent
+
+_ROUTE_PROVIDER_KEYS = {
+    "itineraryManageAgent": "itinerary_manage_agent",
+    "bookingAgent": "booking_agent",
+    "infoAgent": "info_agent",
+}
+_PROVIDER_AGENT_NAMES = {value: key for key, value in _ROUTE_PROVIDER_KEYS.items()}
 
 _USER_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
 _MINIMUM_TOKEN_LENGTH = 32
@@ -43,6 +77,9 @@ _SUSPENDABLE_PRIVACY_STATES = frozenset({"deletion_pending", "deleted"})
 _TERMINAL_RUN_STATUSES = frozenset(
     {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}
 )
+# 流式回答按字符数合并发布，兼顾实时性与事件存储写入量。
+_TOKEN_FLUSH_CHARS = 24
+_LOGGER = logging.getLogger("travel_agent_agent.internal_commands")
 
 
 class InternalUserContext(BaseModel):
@@ -106,6 +143,7 @@ class ResumeRunCommand(_RunCommandBase):
     task_brief: str = Field(min_length=1, max_length=8000)
     context_summary: str = Field(max_length=2000)
     resume_decision: ResumeDecision | None = None
+    quick_action: str | None = Field(default=None, max_length=32)
 
 
 class ResumeDecision(BaseModel):
@@ -142,6 +180,64 @@ class CancelRunCommand(_RunCommandBase):
     command: Literal["cancel"]
 
 
+class RecommendationCommand(_RunCommandBase):
+    """表示主答案完成后异步请求推荐问题的内部命令。"""
+
+    command: Literal["recommendations"]
+    user_question: str = Field(min_length=1, max_length=8000)
+    assistant_reply: str = Field(min_length=1, max_length=16000)
+    context_summary: str = Field(default="", max_length=2000)
+    answer_version: str = Field(pattern=_USER_ID_PATTERN)
+    run_status: Literal[
+        "proposed",
+        "running",
+        "clarifying",
+        "awaiting_approval",
+        "completed",
+        "failed",
+        "cancelled",
+    ]
+    has_pending_interaction: bool = False
+
+
+class ConversationTitleCommand(_RunCommandBase):
+    """表示意图识别完成后异步请求会话标题的内部命令。"""
+
+    command: Literal["conversation_title"]
+    user_question: str = Field(min_length=1, max_length=8000)
+    intent_result_json: str = Field(default="", max_length=2000)
+
+
+class DebugAgentCommand(_RunCommandBase):
+    """表示管理员调试直达某个子智能体的内部命令。"""
+
+    command: Literal["debug_agent"]
+    message: str = Field(min_length=1, max_length=8000)
+    context_summary: str = Field(default="", max_length=2000)
+
+
+class MemoryRecordRequest(BaseModel):
+    """约束偏好写入请求，只接受有限长度的脱敏偏好句子。"""
+
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=2000)
+
+
+class MemoryRetrieveRequest(BaseModel):
+    """约束偏好召回请求，只接受有限长度的查询文本。"""
+
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=1, max_length=1000)
+
+
+class PreferenceParseRequest(BaseModel):
+    """约束偏好解析请求：记忆原文与目录（key → 允许取值）。"""
+
+    model_config = ConfigDict(extra="forbid")
+    memory_text: str = Field(min_length=1, max_length=8000)
+    catalog: dict[str, list[str]] = Field(min_length=1, max_length=64)
+
+
 class RunCommandResult(BaseModel):
     """返回检查点已接受的运行状态、版本及全部运行关联标识。"""
 
@@ -159,6 +255,7 @@ class RunCommandResult(BaseModel):
     intent_source: str | None = None
     diagnostics: dict[str, object] = Field(default_factory=dict)
     pending_interaction: dict[str, Any] | None = None
+    assistant_reply: str | None = None
 
 
 async def require_internal_service(
@@ -221,6 +318,352 @@ def register_internal_command_routes(application: FastAPI | APIRouter) -> None:
         )
 
     @application.post(
+        "/internal/v1/recommendations",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def generate_recommendations(
+        request: Request,
+        command: RecommendationCommand,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """异步生成并发布推荐；跳过条件和模型失败均不影响主 Run。"""
+        _validate_run_command(
+            request,
+            command,
+            x_internal_user_id,
+            x_internal_user_role,
+            x_internal_privacy_status,
+        )
+        if (
+            command.run_status in {"clarifying", "awaiting_approval", "failed", "cancelled"}
+            or command.has_pending_interaction
+        ):
+            return {"status": "skipped", "items": []}
+        agent = getattr(request.app.state, "recommendation_agent", None)
+        store = cast(
+            RecommendationEventStore | None,
+            getattr(request.app.state, "recommendation_event_store", None),
+        )
+        if agent is None or store is None:
+            return {"status": "skipped", "items": []}
+        await _publish_diagnostic(request, command, "recommendation_started", {"status": "running"})
+        try:
+            items = await agent.recommend(
+                command.user_question,
+                command.assistant_reply,
+                command.context_summary,
+            )
+            if items:
+                await store.publish(
+                    command.run_id,
+                    command.trace_id,
+                    command.answer_version,
+                    items,
+                )
+            recommendation_status = "published" if items else "empty"
+            await _publish_diagnostic(
+                request,
+                command,
+                "recommendation_completed",
+                {"status": recommendation_status, "count": len(items)},
+            )
+            return {"status": recommendation_status, "items": items}
+        except Exception as error:
+            _LOGGER.warning(
+                "recommendation_sidecar_failed trace_id=%s request_id=%s run_id=%s error_type=%s",
+                command.trace_id,
+                command.request_id,
+                command.run_id,
+                type(error).__name__,
+            )
+            await _publish_diagnostic(
+                request, command, "recommendation_completed", {"status": "failed"}
+            )
+            return {"status": "failed", "items": []}
+
+    @application.post(
+        "/internal/v1/conversation-title",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def generate_conversation_title(
+        request: Request,
+        command: ConversationTitleCommand,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """按用户问题与意图结果生成会话标题，并发布标题事件供前端刷新列表。"""
+        _validate_run_command(
+            request,
+            command,
+            x_internal_user_id,
+            x_internal_user_role,
+            x_internal_privacy_status,
+        )
+        agent = getattr(request.app.state, "title_agent", None)
+        if not isinstance(agent, ConversationTitleAgent):
+            return {"status": "skipped", "title": None}
+        try:
+            title = await agent.generate(command.user_question, command.intent_result_json)
+        except Exception as error:
+            _LOGGER.warning(
+                "conversation_title_failed trace_id=%s request_id=%s run_id=%s error_type=%s",
+                command.trace_id,
+                command.request_id,
+                command.run_id,
+                type(error).__name__,
+            )
+            return {"status": "failed", "title": None}
+        if not title:
+            return {"status": "empty", "title": None}
+        store = cast(
+            RecommendationEventStore | None,
+            getattr(request.app.state, "recommendation_event_store", None),
+        )
+        if store is not None:
+            try:
+                await store.publish_conversation_title(
+                    command.run_id, command.trace_id, title
+                )
+            except Exception as error:
+                _LOGGER.warning(
+                    "conversation_title_event_failed trace_id=%s run_id=%s error_type=%s",
+                    command.trace_id,
+                    command.run_id,
+                    type(error).__name__,
+                )
+        return {"status": "generated", "title": title}
+
+    @application.post(
+        "/internal/v1/memory/retrieve",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def retrieve_memory(
+        request: Request,
+        payload: MemoryRetrieveRequest,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """召回当前登录用户的长期偏好；未配置记忆库时降级为不可用。"""
+        user_id = _require_internal_user(
+            x_internal_user_id, x_internal_user_role, x_internal_privacy_status
+        )
+        client = getattr(request.app.state, "memory_client", None)
+        if client is None:
+            return {"available": False, "memories": "", "message": "长期记忆当前未启用。"}
+        return dict(await client.retrieve(user_id, payload.query))
+
+    @application.post(
+        "/internal/v1/memory/record",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def record_memory(
+        request: Request,
+        payload: MemoryRecordRequest,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """把当前登录用户的偏好写入长期记忆；未配置记忆库时降级为未保存。"""
+        user_id = _require_internal_user(
+            x_internal_user_id, x_internal_user_role, x_internal_privacy_status
+        )
+        client = getattr(request.app.state, "memory_client", None)
+        if client is None:
+            return {"available": False, "message": "长期记忆当前未启用，本次偏好未被保存。"}
+        return dict(await client.record(user_id, payload.content))
+
+    @application.post(
+        "/internal/v1/memory/preferences",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def parse_preferences(
+        request: Request,
+        payload: PreferenceParseRequest,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """把记忆原文解析为目录内的结构化偏好；模型失败时返回空结构而不报错。"""
+        _require_internal_user(
+            x_internal_user_id, x_internal_user_role, x_internal_privacy_status
+        )
+        agent = getattr(request.app.state, "preference_agent", None)
+        if not isinstance(agent, PreferenceParseAgent):
+            return {"preferences": {}}
+        return {"preferences": await agent.parse(payload.memory_text, payload.catalog)}
+
+    @application.get(
+        "/internal/v1/debug/agents",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def list_debug_agents(
+        request: Request,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """列出可调试直达的智能体及启用状态，不触发任何模型调用。"""
+        if (
+            not x_internal_user_id
+            or x_internal_user_role != "admin"
+            or x_internal_privacy_status != "active"
+        ):
+            raise ServiceError(
+                "internal_user_context_mismatch", "内部用户上下文校验失败", False, 403
+            )
+        master_agent = getattr(request.app.state, "master_agent", None)
+        if not isinstance(master_agent, MasterAgent):
+            raise ServiceError("master_agent_unavailable", "主控智能体暂不可用", True, 503)
+        agents: list[dict[str, object]] = [
+            {"name": "masterAgent", "provider_key": None, "enabled": True}
+        ]
+        agents.extend(
+            {
+                "name": _provider_agent_name(config.key),
+                "provider_key": config.key,
+                "enabled": config.enabled,
+            }
+            for config in master_agent.provider.enabled_configs
+        )
+        return {"agents": agents}
+
+    @application.post(
+        "/internal/v1/debug/agents/{agent_name}",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def debug_agent(
+        agent_name: str,
+        request: Request,
+        command: DebugAgentCommand,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """绕过意图识别，把消息直接交给指定智能体，供管理员调试。"""
+        if (
+            not x_internal_user_id
+            or x_internal_user_role != "admin"
+            or x_internal_privacy_status != "active"
+        ):
+            raise ServiceError(
+                "internal_user_context_mismatch", "内部用户上下文校验失败", False, 403
+            )
+        _validate_run_command(
+            request,
+            command,
+            x_internal_user_id,
+            x_internal_user_role,
+            x_internal_privacy_status,
+        )
+        master_agent = getattr(request.app.state, "master_agent", None)
+        if not isinstance(master_agent, MasterAgent):
+            raise ServiceError("master_agent_unavailable", "主控智能体暂不可用", True, 503)
+        provider_key = {
+            _provider_agent_name(config.key): config.key
+            for config in master_agent.provider.enabled_configs
+        }.get(agent_name)
+        if agent_name != "masterAgent" and provider_key is None:
+            raise ServiceError("debug_agent_not_found", "智能体不存在或未启用", False, 404)
+        session_id = f"{command.thread_id}:debug:{agent_name}"
+        context = AgentContext(
+            trace_id=command.trace_id,
+            request_id=command.request_id,
+            run_id=command.run_id,
+            thread_id=command.thread_id,
+            conversation_id=command.conversation_id,
+            user_id=command.user.user_id,
+            role=command.user.role,
+            context_summary=command.context_summary,
+            diagnostic_callback=lambda event_type, data: _publish_diagnostic(
+                request, command, event_type, data
+            ),
+        )
+        if provider_key is None:
+            from travel_agent_agent.agents.master.agent import serialize_intent_result_json
+            recognition = _debug_unknown_recognition(command.trace_id)
+            result = await master_agent.ainvoke(
+                command.message,
+                command.message,
+                serialize_intent_result_json(recognition),
+                session_id=session_id,
+                context=context,
+            )
+        else:
+            from travel_agent_agent.agents.master.provider import SubAgentRequest
+
+            sub_result = await master_agent.provider.invoke(
+                provider_key,
+                SubAgentRequest(message=command.message, session_id=session_id, context=context),
+            )
+            result = {"messages": [{"content": sub_result.content}]}
+        return {
+            "agent": agent_name,
+            "assistant_reply": _extract_assistant_content(result) or "",
+            "pending_interaction": _interrupt_payload(result),
+        }
+
+    @application.get(
+        "/internal/v1/recommendations/{run_id}/events",
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def list_recommendation_events(
+        run_id: str,
+        request: Request,
+        conversation_id: str,
+        thread_id: str,
+        last_event_id: str | None = None,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """读取当前 Run 的推荐事件，供 API Server 转发为浏览器 SSE。"""
+        if (
+            not x_internal_user_id
+            or x_internal_user_role not in {"user", "admin"}
+            or x_internal_privacy_status != "active"
+        ):
+            raise ServiceError(
+                "internal_user_context_mismatch", "内部用户上下文校验失败", False, 403
+            )
+        context = get_correlation_context(request)
+        if (context.run_id, context.thread_id) != (run_id, thread_id):
+            raise ServiceError(
+                "internal_correlation_mismatch", "内部调用链标识校验失败", False, 403
+            )
+        store = cast(
+            RecommendationEventStore | None,
+            getattr(request.app.state, "recommendation_event_store", None),
+        )
+        if store is None:
+            raise ServiceError(
+                "recommendation_event_store_unavailable", "推荐事件服务暂不可用", True, 503
+            )
+        try:
+            events = await store.list_events(run_id, last_event_id)
+        except RecommendationEventError as error:
+            raise ServiceError(
+                "recommendation_event_store_unavailable", "推荐事件服务暂不可用", True, 503
+            ) from error
+        return {
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "events": events,
+        }
+
+    @application.post(
         "/internal/v1/commands/runs/start",
         response_model=RunCommandResult,
         dependencies=[Depends(require_internal_service)],
@@ -241,8 +684,10 @@ def register_internal_command_routes(application: FastAPI | APIRouter) -> None:
             x_internal_user_role,
             x_internal_privacy_status,
         )
-        checkpoint = await _apply_run_command(request, command)
-        return await _with_pending_interaction(request, command, checkpoint)
+        checkpoint, interrupted = await _execute_run_command(request, command, None)
+        return await _with_pending_interaction(
+            request, command, checkpoint, include_pending=not interrupted
+        )
 
     @application.post(
         "/internal/v1/commands/runs/resume",
@@ -266,8 +711,12 @@ def register_internal_command_routes(application: FastAPI | APIRouter) -> None:
             x_internal_user_role,
             x_internal_privacy_status,
         )
-        checkpoint = await _apply_run_command(request, command, x_confirmation_token)
-        return await _with_pending_interaction(request, command, checkpoint)
+        checkpoint, interrupted = await _execute_run_command(
+            request, command, x_confirmation_token
+        )
+        return await _with_pending_interaction(
+            request, command, checkpoint, include_pending=not interrupted
+        )
 
     @application.post(
         "/internal/v1/commands/runs/cancel",
@@ -283,6 +732,33 @@ def register_internal_command_routes(application: FastAPI | APIRouter) -> None:
         x_internal_privacy_status: Annotated[str | None, Header()] = None,
     ) -> RunCommandResult:
         """将指定 Run 标记为 cancelled；真正的 Agent 执行器接入时需同时监听该状态。"""
+        _validate_run_command(
+            request,
+            command,
+            x_internal_user_id,
+            x_internal_user_role,
+            x_internal_privacy_status,
+        )
+        checkpoint = await _apply_run_command(request, command)
+        return _run_command_result(command, checkpoint)
+
+    @application.post(
+        "/internal/v1/commands/runs/{run_id}/interrupt",
+        response_model=RunCommandResult,
+        dependencies=[Depends(require_internal_service)],
+        include_in_schema=False,
+    )
+    async def interrupt_run(
+        run_id: str,
+        request: Request,
+        command: CancelRunCommand,
+        x_internal_user_id: Annotated[str | None, Header()] = None,
+        x_internal_user_role: Annotated[str | None, Header()] = None,
+        x_internal_privacy_status: Annotated[str | None, Header()] = None,
+    ) -> RunCommandResult:
+        """停止指定 Run：本地取消在途执行、清理待交互并广播到其它节点。"""
+        if command.run_id != run_id:
+            raise ServiceError("internal_run_context_mismatch", "运行上下文校验失败", False, 403)
         _validate_run_command(
             request,
             command,
@@ -402,6 +878,84 @@ def _checkpoint_store(request: Request) -> RunCheckpointStore:
     return cast(RunCheckpointStore, request.app.state.checkpoint_store)
 
 
+def _run_registry(request: Request) -> RunExecutionRegistry:
+    """获取本节点的在途运行注册表。"""
+    registry = getattr(request.app.state, "run_registry", None)
+    if not isinstance(registry, RunExecutionRegistry):
+        raise ServiceError(
+            "run_registry_unavailable", "运行执行器暂不可用", True, 503
+        )
+    return registry
+
+
+def _interrupt_coordinator(request: Request) -> RunInterruptCoordinator:
+    """获取中断协调器，用于本地取消与跨节点广播。"""
+    coordinator = getattr(request.app.state, "interrupt_coordinator", None)
+    if not isinstance(coordinator, RunInterruptCoordinator):
+        raise ServiceError(
+            "interrupt_coordinator_unavailable", "运行中断服务暂不可用", True, 503
+        )
+    return coordinator
+
+
+async def _execute_run_command(
+    request: Request,
+    command: StartRunCommand | ResumeRunCommand,
+    confirmation_token: str | None,
+) -> tuple[RunCheckpoint, bool]:
+    """登记在途运行并执行命令；被中断时返回取消态与中断标记。"""
+    coordinator = _interrupt_coordinator(request)
+    registry = _run_registry(request)
+    await coordinator.preempt(command.conversation_id)
+    execution = registry.register(
+        command.conversation_id,
+        command.run_id,
+        user_id=command.user.user_id,
+        thread_id=command.thread_id,
+    )
+    try:
+        checkpoint = await _apply_run_command(request, command, confirmation_token)
+        return checkpoint, False
+    except asyncio.CancelledError:
+        _release_current_cancellation()
+        await _publish_interrupted(request, command, execution)
+        cancelled = await _checkpoint_store(request).cancel(
+            command.user.user_id,
+            command.conversation_id,
+            command.run_id,
+            command.thread_id,
+        )
+        return cancelled, True
+    finally:
+        registry.finish(command.conversation_id, command.run_id)
+
+
+def _release_current_cancellation() -> None:
+    """递减当前任务的取消计数，使中断后的收尾逻辑仍可继续 await。"""
+    task = asyncio.current_task()
+    uncancel = getattr(task, "uncancel", None)
+    if callable(uncancel):
+        uncancel()
+
+
+async def _publish_interrupted(
+    request: Request,
+    command: StartRunCommand | ResumeRunCommand,
+    execution: RunExecution,
+) -> None:
+    """发布 interrupted 事件，供 API 与前端标记本轮已被用户停止。"""
+    await _publish_diagnostic(
+        request,
+        command,
+        "interrupted",
+        {
+            "status": "cancelled",
+            "reason": "user_interrupted",
+            "conversation_id": execution.conversation_id,
+        },
+    )
+
+
 def _validate_internal_user_headers(
     user: InternalUserContext,
     user_id: str | None,
@@ -453,6 +1007,8 @@ async def _apply_run_command(
                 return checkpoint
             return await _apply_intent_master_route(request, command)
         if command.command == "resume":
+            if command.quick_action is not None:
+                return await _apply_quick_action(request, command)
             if command.resume_decision is not None:
                 return await _resume_pending_interaction(request, command, confirmation_token)
             checkpoint = await store.resume(
@@ -475,6 +1031,9 @@ async def _apply_run_command(
             command.conversation_id,
             command.run_id,
             command.thread_id,
+        )
+        await _interrupt_coordinator(request).interrupt(
+            command.conversation_id, command.run_id
         )
         return checkpoint
     except CheckpointError as error:
@@ -512,42 +1071,131 @@ async def _apply_intent_master_route(
 ) -> RunCheckpoint:
     """对本轮消息执行 L0～L3 并保存 Master 路由结论；上下文只接收 API 脱敏摘要。"""
     intent_agent = cast(IntentRecognitionAgent, request.app.state.intent_agent)
-    recognition, rewritten_question = await intent_agent.execute_with_rewrite(
-        command.task_brief,
-        AgentContext(
-            trace_id=command.trace_id,
-            request_id=command.request_id,
-            run_id=command.run_id,
-            thread_id=command.thread_id,
-            conversation_id=command.conversation_id,
-            user_id=command.user.user_id,
-            role=command.user.role,
-            context_summary=command.context_summary,
-        ),
+    # 先发布一条"已开始处理"，让前端在识别阶段就有可见进展，而不是空白等待。
+    await _publish_diagnostic(
+        request,
+        command,
+        "run_started",
+        {"conversation_id": command.conversation_id, "status": "running"},
     )
+    try:
+        recognition, rewritten_question = await intent_agent.execute_with_rewrite(
+            command.task_brief,
+            AgentContext(
+                trace_id=command.trace_id,
+                request_id=command.request_id,
+                run_id=command.run_id,
+                thread_id=command.thread_id,
+                conversation_id=command.conversation_id,
+                user_id=command.user.user_id,
+                role=command.user.role,
+                context_summary=command.context_summary,
+            ),
+        )
+    except Exception as error:
+        error_code, retryable = _normalize_execution_error(
+            error, "intent_recognition_failed"
+        )
+        _log_execution_failure(command, error, error_code)
+        await _publish_diagnostic(
+            request,
+            command,
+            "run_error",
+            {
+                "stage": "intent_recognition",
+                "error_type": "provider_error",
+                "error_code": error_code,
+                "retryable": retryable,
+            },
+        )
+        route = RunRoute(
+            RouteAction.CLARIFY,
+            "masterAgent",
+            None,
+            None,
+            {
+                "intent_execution": "failed",
+                "intent_error_code": error_code,
+                "intent_retryable": retryable,
+            },
+        )
+        return await _checkpoint_store(request).apply_route(
+            command.user.user_id,
+            command.conversation_id,
+            command.run_id,
+            command.thread_id,
+            route,
+            RunStatus.FAILED,
+        )
+    await _publish_diagnostic(
+        request,
+        command,
+        "intent_recognition",
+        {
+            "source": recognition.source.value,
+            "intent_code": recognition.primary_intent,
+            "confidence": recognition.intents[0].confidence.value,
+            "reason": recognition.intents[0].reason,
+            "multi_intent": recognition.multi_intent,
+            "diagnostics": recognition.diagnostics,
+        },
+    )
+    rewrite_called = bool(recognition.diagnostics.get("rewrite_called"))
+    rewrite_data: dict[str, object] = {
+        "status": "completed" if rewrite_called else "skipped",
+        "reason": "executed_after_l1_l2_miss" if rewrite_called else "l2_hit_or_l1_hit",
+        "changed": rewritten_question.strip() != command.task_brief.strip(),
+    }
+    if rewrite_called:
+        rewrite_data["rewritten_question"] = SensitiveMasker().mask_text(rewritten_question)[:8000]
+    await _publish_diagnostic(request, command, "query_rewrite", rewrite_data)
     route, target_status = route_from_recognition(recognition)
     route.diagnostics["master_input"] = {
         "rewritten_question_present": bool(rewritten_question),
         "intent_result_json_present": True,
     }
+    await _publish_diagnostic(
+        request,
+        command,
+        "route_selected",
+        {
+            "action": route.action.value,
+            "target_agent": route.target_agent,
+            "intent_code": route.intent_code,
+            "intent_source": route.intent_source,
+        },
+    )
+    async def publish_knowledge_diagnostic(event_type: str, data: dict[str, object]) -> None:
+        """将 InfoAgent 的安全知识库诊断事件写入当前 Run 事件流。"""
+        await _publish_diagnostic(request, command, event_type, data)
+
     master_agent = getattr(request.app.state, "master_agent", None)
     if isinstance(master_agent, MasterAgent):
+        await _publish_diagnostic(request, command, "master_started", {"status": "running"})
+        if route.action is RouteAction.DIRECT_DISPATCH and route.target_agent != "masterAgent":
+            await _publish_diagnostic(
+                request,
+                command,
+                "sub_agent_started",
+                {"agent": route.target_agent, "status": "running"},
+            )
+        usage_token, usage = bind_token_usage()
         try:
-            result = await master_agent.ainvoke(
-                command.task_brief,
-                rewritten_question,
-                recognition.model_dump_json(),
-                session_id=command.thread_id,
-                context=AgentContext(
-                    trace_id=command.trace_id,
-                    request_id=command.request_id,
-                    run_id=command.run_id,
-                    thread_id=command.thread_id,
-                    conversation_id=command.conversation_id,
-                    user_id=command.user.user_id,
-                    role=command.user.role,
-                    context_summary=command.context_summary,
-                ),
+            try:
+                result = await _stream_master_reply(
+                    request,
+                    command,
+                    master_agent,
+                    rewritten_question,
+                    recognition.model_dump_json(),
+                    publish_knowledge_diagnostic,
+                )
+            finally:
+                reset_token_usage(usage_token)
+            # 逐轮累计的真实用量只以统计口径进入诊断，不包含任何消息正文。
+            route.diagnostics["token_usage"] = usage.as_dict()
+            await _publish_diagnostic(
+                request, command, "token_usage", dict(usage.as_dict())
             )
             route.diagnostics["master_execution"] = "invoked"
             interrupt_kind = await _issue_graph_interrupt(
@@ -557,8 +1205,64 @@ async def _apply_intent_master_route(
                 target_status = RunStatus.CLARIFYING
             elif interrupt_kind == "approval":
                 target_status = RunStatus.AWAITING_APPROVAL
-        except Exception:
-            route.diagnostics["master_execution"] = "unavailable"
+            else:
+                # 无可恢复中断且已产出回复，说明本轮已正常完成。
+                target_status = RunStatus.COMPLETED
+            if route.action is RouteAction.DIRECT_DISPATCH and route.target_agent != "masterAgent":
+                await _publish_diagnostic(
+                    request,
+                    command,
+                    "sub_agent_completed",
+                    {"agent": route.target_agent, "status": "completed"},
+                )
+            await _publish_diagnostic(
+                request, command, "master_completed", {"status": "completed"}
+            )
+            await _publish_assistant_reply(request, command, result)
+        except Exception as error:
+            # 仅记录稳定错误类型/错误码，不记录用户消息、密钥或异常正文。
+            error_code, retryable = _normalize_execution_error(
+                error, "master_agent_execution_failed"
+            )
+            route.diagnostics.update(
+                {
+                    "master_execution": "failed",
+                    "master_error_type": "provider_error",
+                    "master_error_code": error_code,
+                    "master_retryable": retryable,
+                }
+            )
+            _LOGGER.error(
+                "master_agent_execution_failed trace_id=%s request_id=%s "
+                "run_id=%s thread_id=%s error_type=%s error_code=%s retryable=%s chain=%s",
+                command.trace_id,
+                command.request_id,
+                command.run_id,
+                command.thread_id,
+                type(error).__name__,
+                error_code,
+                retryable,
+                _describe_exception_chain(error),
+            )
+            await _publish_diagnostic(
+                request,
+                command,
+                "run_error",
+                {
+                    "stage": "master",
+                    "error_type": "provider_error",
+                    "error_code": error_code,
+                    "retryable": retryable,
+                },
+            )
+            if route.action is RouteAction.DIRECT_DISPATCH and route.target_agent != "masterAgent":
+                await _publish_diagnostic(
+                    request,
+                    command,
+                    "sub_agent_completed",
+                    {"agent": route.target_agent, "status": "failed"},
+                )
+            target_status = RunStatus.FAILED
     store = cast(RunCheckpointStore, request.app.state.checkpoint_store)
     return await store.apply_route(
         command.user.user_id,
@@ -592,6 +1296,17 @@ async def _resume_pending_interaction(
         )
     except InteractionError as error:
         raise _interaction_error_to_service_error(error) from error
+    if interaction.kind == "approval" and decision.decision == "approve":
+        # 用户已提交批准决定：恢复执行需要模型多轮推理才会真正调用写工具并消费
+        # Token，这段窗口内若继续向查询接口暴露同一交互，前端会反复弹出确认卡片
+        # 并与已到达的助手回复冲突。这里只摘除展示索引，Token 仍保留以便原子消费。
+        await interactions.hide_from_display(
+            interaction.interaction_id,
+            user_id=command.user.user_id,
+            conversation_id=command.conversation_id,
+            run_id=command.run_id,
+            thread_id=command.thread_id,
+        )
     if decision.decision == "edit":
         await interactions.reject(
             interaction.interaction_id,
@@ -620,6 +1335,15 @@ async def _resume_pending_interaction(
             run_id=command.run_id,
             thread_id=command.thread_id,
         )
+    if decision.decision == "respond":
+        # 澄清类交互用完即关闭，避免恢复成功后前端仍显示旧问题卡片。
+        await interactions.consume_answered(
+            interaction.interaction_id,
+            user_id=command.user.user_id,
+            conversation_id=command.conversation_id,
+            run_id=command.run_id,
+            thread_id=command.thread_id,
+        )
     resume_value: dict[str, Any]
     if interaction.kind == "clarification":
         resume_value = {"message": decision.message or command.task_brief}
@@ -641,6 +1365,9 @@ async def _resume_pending_interaction(
         user_id=command.user.user_id,
         role=command.user.role,
         context_summary=command.context_summary,
+        diagnostic_callback=lambda event_type, data: _publish_diagnostic(
+            request, command, event_type, data
+        ),
     )
     authorization = None
     if interaction.kind == "approval" and decision.decision == "approve":
@@ -649,6 +1376,7 @@ async def _resume_pending_interaction(
         )
     try:
         result = await master_agent.aresume(resume_value, command.thread_id, context)
+        await _publish_assistant_reply(request, command, result)
     finally:
         if authorization is not None:
             reset_tool_execution_authorization(authorization)
@@ -658,6 +1386,8 @@ async def _resume_pending_interaction(
         target = RunStatus.CLARIFYING
     elif interrupt_kind == "approval":
         target = RunStatus.AWAITING_APPROVAL
+    else:
+        target = RunStatus.COMPLETED
     route = checkpoint.route or RunRoute(RouteAction.CLARIFY, "masterAgent", None, None)
     return await _checkpoint_store(request).apply_route(
         command.user.user_id,
@@ -669,14 +1399,93 @@ async def _resume_pending_interaction(
     )
 
 
+async def _apply_quick_action(
+    request: Request, command: ResumeRunCommand
+) -> RunCheckpoint:
+    """校验快速操作并沿用既有直达路由恢复当前子 Agent。"""
+    quick_action = command.quick_action
+    if quick_action is None or not continuation_signals.is_valid(quick_action):
+        raise ServiceError("quick_action_invalid", "快速操作无效", False, 422)
+    checkpoint = await _checkpoint_store(request).resume(
+        command.user.user_id,
+        command.conversation_id,
+        command.run_id,
+        command.thread_id,
+    )
+    if checkpoint.state.status in _TERMINAL_RUN_STATUSES:
+        raise ServiceError("quick_action_route_unavailable", "当前运行无法快速续跑", False, 409)
+    route = checkpoint.route
+    if route is None or route.action is not RouteAction.DIRECT_DISPATCH:
+        raise ServiceError("quick_action_route_unavailable", "当前运行无法快速续跑", False, 409)
+    master_agent = getattr(request.app.state, "master_agent", None)
+    if not isinstance(master_agent, MasterAgent):
+        raise ServiceError("master_agent_unavailable", "主控智能体暂不可用", True, 503)
+    from travel_agent_agent.agents.master.provider import SubAgentRequest
+
+    context = AgentContext(
+        trace_id=command.trace_id,
+        request_id=command.request_id,
+        run_id=command.run_id,
+        thread_id=command.thread_id,
+        conversation_id=command.conversation_id,
+        user_id=command.user.user_id,
+        role=command.user.role,
+        context_summary=command.context_summary,
+        diagnostic_callback=lambda event_type, data: _publish_diagnostic(
+            request, command, event_type, data
+        ),
+    )
+    provider_key = _ROUTE_PROVIDER_KEYS.get(route.target_agent)
+    if provider_key is None:
+        raise ServiceError("quick_action_route_unavailable", "当前运行无法快速续跑", False, 409)
+    result = await master_agent.provider.invoke(
+        provider_key,
+        SubAgentRequest(
+            message=continuation_signals.normalize(quick_action),
+            session_id=f"{command.thread_id}:{provider_key}",
+            context=context,
+        ),
+    )
+    await _publish_assistant_reply(request, command, result)
+    target_status = RunStatus.RUNNING
+    if result.pending_interaction is not None:
+        interrupt_kind = await _issue_graph_interrupt(
+            request,
+            command,
+            {"__interrupt__": [result.pending_interaction]},
+            command.thread_id,
+        )
+        if interrupt_kind == "clarification":
+            target_status = RunStatus.CLARIFYING
+        elif interrupt_kind == "approval":
+            target_status = RunStatus.AWAITING_APPROVAL
+        else:
+            target_status = RunStatus.COMPLETED
+    else:
+        target_status = RunStatus.COMPLETED
+    return await _checkpoint_store(request).apply_route(
+        command.user.user_id,
+        command.conversation_id,
+        command.run_id,
+        command.thread_id,
+        route,
+        target_status,
+    )
+
+
 async def _with_pending_interaction(
     request: Request,
     command: StartRunCommand | ResumeRunCommand | CancelRunCommand,
     checkpoint: RunCheckpoint,
+    *,
+    include_pending: bool = True,
 ) -> RunCommandResult:
     """将当前 Run 的待交互安全摘要附加到内部命令响应。"""
     result = _run_command_result(command, checkpoint)
-    if command.command == "cancel":
+    assistant_reply = getattr(request.state, "assistant_reply", None)
+    if isinstance(assistant_reply, str):
+        result = result.model_copy(update={"assistant_reply": assistant_reply})
+    if command.command == "cancel" or not include_pending:
         return result
     try:
         pending = await _interaction_store(request).get_for_display(
@@ -688,6 +1497,160 @@ async def _with_pending_interaction(
     except InteractionError as error:
         raise _interaction_error_to_service_error(error) from error
     return result.model_copy(update={"pending_interaction": pending})
+
+
+async def _publish_assistant_reply(
+    request: Request,
+    command: StartRunCommand | ResumeRunCommand,
+    result: object,
+) -> None:
+    """提取并脱敏主回复，发布旁路事件且不让事件故障影响主 Run。"""
+    content = _extract_assistant_content(result)
+    if not content:
+        return
+    sanitized = SensitiveMasker().mask_text(content)[:16000]
+    request.state.assistant_reply = sanitized
+    store = cast(
+        RecommendationEventStore | None,
+        getattr(request.app.state, "recommendation_event_store", None),
+    )
+    if store is None:
+        return
+    try:
+        await store.publish_assistant_reply(
+            command.run_id,
+            command.trace_id,
+            f"{command.run_id}-{hashlib.sha256(sanitized.encode('utf-8')).hexdigest()[:16]}",
+            sanitized,
+        )
+    except Exception as error:
+        _LOGGER.warning(
+            "assistant_event_publish_failed trace_id=%s request_id=%s run_id=%s error_type=%s",
+            command.trace_id,
+            command.request_id,
+            command.run_id,
+            type(error).__name__,
+        )
+
+
+async def _publish_diagnostic(
+    request: Request,
+    command: StartRunCommand | ResumeRunCommand | RecommendationCommand | DebugAgentCommand,
+    event_type: str,
+    data: dict[str, object],
+) -> None:
+    """发布安全执行阶段事件；事件存储故障只记录 warning，不影响主流程。"""
+    store = cast(
+        RecommendationEventStore | None,
+        getattr(request.app.state, "recommendation_event_store", None),
+    )
+    if store is None:
+        return
+    try:
+        await store.publish_diagnostic(command.run_id, command.trace_id, event_type, data)
+    except Exception as error:
+        _LOGGER.warning(
+            "diagnostic_event_publish_failed trace_id=%s request_id=%s run_id=%s "
+            "event_type=%s error_type=%s",
+            command.trace_id,
+            command.request_id,
+            command.run_id,
+            event_type,
+            type(error).__name__,
+        )
+
+
+def _require_internal_user(
+    user_id: str | None, role: str | None, privacy_status: str | None
+) -> str:
+    """校验内部调用携带的用户身份，返回可用的 user_id。"""
+    if not user_id or role not in {"user", "admin"} or privacy_status != "active":
+        raise ServiceError(
+            "internal_user_context_mismatch", "内部用户上下文校验失败", False, 403
+        )
+    return user_id
+
+
+async def _stream_master_reply(
+    request: Request,
+    command: StartRunCommand | ResumeRunCommand,
+    master_agent: MasterAgent,
+    rewritten_question: str,
+    intent_result_json: str,
+    diagnostic_callback: Callable[[str, dict[str, object]], Awaitable[None]],
+) -> object:
+    """流式执行主控并把回答分片发布为 token 事件，最后返回完整图状态。"""
+    context = AgentContext(
+        trace_id=command.trace_id,
+        request_id=command.request_id,
+        run_id=command.run_id,
+        thread_id=command.thread_id,
+        conversation_id=command.conversation_id,
+        user_id=command.user.user_id,
+        role=command.user.role,
+        context_summary=command.context_summary,
+        diagnostic_callback=diagnostic_callback,
+    )
+    buffer = ""
+    result: object = None
+    async for kind, payload in master_agent.astream(
+        command.task_brief,
+        rewritten_question,
+        intent_result_json,
+        session_id=command.thread_id,
+        context=context,
+    ):
+        if kind != "delta":
+            result = payload
+            continue
+        buffer += str(payload)
+        # 合并小分片后再发布，避免每个 token 都写一次事件存储。
+        if len(buffer) >= _TOKEN_FLUSH_CHARS:
+            await _publish_diagnostic(request, command, "token", {"text": buffer})
+            buffer = ""
+    if buffer:
+        await _publish_diagnostic(request, command, "token", {"text": buffer})
+    return result
+
+
+def _provider_agent_name(provider_key: str) -> str:
+    """把子 Agent 的 provider key 还原为对外的 camelCase 名称。"""
+    return _PROVIDER_AGENT_NAMES.get(provider_key, provider_key)
+
+
+def _debug_unknown_recognition(trace_id: str) -> IntentRecognitionResult:
+    """调试主控时构造固定的 unknown 意图，避免伪造识别结果。"""
+    return IntentRecognitionResult(
+        intents=(
+            RecognizedIntent(
+                intent="unknown",
+                target_agent="masterAgent",
+                confidence=IntentConfidence.LOW,
+                reason="管理员调试直达主控。",
+            ),
+        ),
+        primary_intent="unknown",
+        multi_intent=False,
+        overall_reason="管理员调试直达主控。",
+        source=IntentSource.LLM,
+        trace_id=trace_id,
+    )
+
+
+def _extract_assistant_content(result: object) -> str | None:
+    """从 LangGraph 或子 Agent 结果读取最后一条面向用户的文本。"""
+    if isinstance(result, dict):
+        messages = result.get("messages")
+        if isinstance(messages, list) and messages:
+            content = getattr(messages[-1], "content", None)
+            if content is None and isinstance(messages[-1], dict):
+                content = messages[-1].get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    content = getattr(result, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    return None
 
 
 async def _issue_graph_interrupt(
@@ -727,6 +1690,7 @@ async def _issue_graph_interrupt(
                 "message": "该操作会修改差旅业务数据，请确认后继续。",
             },
             token_hash=None,
+            previous_token_hash=None,
             action_version=1,
             created_at="",
         )
@@ -753,6 +1717,7 @@ async def _issue_graph_interrupt(
             "fields": payload.get("fields", []),
         },
         token_hash=None,
+        previous_token_hash=None,
         action_version=1,
         created_at="",
     )
@@ -802,6 +1767,51 @@ def _interrupt_payload(result: object) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_execution_error(error: Exception, default_code: str) -> tuple[str, bool]:
+    """从异常链提取稳定 Provider 错误码，避免把 SDK 类型或响应正文暴露给前端。"""
+    stable_codes = {
+        "dashscope_quota_exhausted",
+        "dashscope_auth_failed",
+        "dashscope_model_unavailable",
+        "dashscope_upstream_unavailable",
+    }
+    upstream_codes = {
+        "insufficient_quota": ("dashscope_quota_exhausted", False),
+        "authentication_error": ("dashscope_auth_failed", False),
+        "invalid_api_key": ("dashscope_auth_failed", False),
+        "model_not_found": ("dashscope_model_unavailable", False),
+        "model_access_denied": ("dashscope_model_unavailable", False),
+        "permission_denied": ("dashscope_model_unavailable", False),
+    }
+    current: BaseException | None = error
+    visited: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in visited:
+            break
+        visited.add(id(current))
+        retryable = bool(getattr(current, "retryable", False))
+        candidates: list[object] = [getattr(current, "code", None)]
+        body = getattr(current, "body", None)
+        if isinstance(body, dict):
+            nested = body.get("error")
+            if isinstance(nested, dict):
+                candidates.extend((nested.get("code"), nested.get("type")))
+            candidates.extend((body.get("code"), body.get("type")))
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            normalized = candidate.strip().lower()
+            if normalized in stable_codes:
+                return normalized, retryable or normalized == "dashscope_upstream_unavailable"
+            if normalized in upstream_codes:
+                return upstream_codes[normalized]
+        status_code = getattr(current, "status_code", None)
+        if status_code in {500, 502, 503, 504}:
+            return "dashscope_upstream_unavailable", True
+        current = current.__cause__ or current.__context__
+    return default_code, False
+
+
 def _checkpoint_error_to_service_error(error: CheckpointError) -> ServiceError:
     """将检查点的有限失败原因转换成 API 可识别而不泄漏基础设施细节的错误。"""
     if str(error) == "checkpoint_not_found_or_expired":
@@ -825,3 +1835,34 @@ def _interaction_error_to_service_error(error: InteractionError) -> ServiceError
     if code == "interaction_concurrent_update":
         return ServiceError("confirmation_update_conflict", "确认状态正在更新，请重试", True, 409)
     return ServiceError("confirmation_rejected", "确认请求未被接受", False, 409)
+
+
+def _describe_exception_chain(error: BaseException, limit: int = 6) -> str:
+    """拼接异常链的类型与截断消息，供排障使用；不包含用户正文或密钥。"""
+    parts: list[str] = []
+    current: BaseException | None = error
+    visited: set[int] = set()
+    for _ in range(limit):
+        if current is None or id(current) in visited:
+            break
+        visited.add(id(current))
+        message = str(current).replace("\n", " ")[:120]
+        parts.append(f"{type(current).__name__}: {message}")
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)[:400]
+
+
+def _log_execution_failure(
+    command: StartRunCommand | ResumeRunCommand, error: Exception, error_code: str
+) -> None:
+    """记录意图识别失败的错误码与异常链，不记录用户消息正文。"""
+    _LOGGER.error(
+        "intent_recognition_failed trace_id=%s request_id=%s run_id=%s "
+        "error_type=%s error_code=%s chain=%s",
+        command.trace_id,
+        command.request_id,
+        command.run_id,
+        type(error).__name__,
+        error_code,
+        _describe_exception_chain(error),
+    )

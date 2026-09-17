@@ -26,3 +26,11 @@ docker/data/
 # Docker Compose 本地服务间密钥；仅在本机生成，不纳入版本控制
 .secrets/*
 !.secrets/README.md
+
+.tmp/
+
+# 本地工具缓存与一次性测试产物：体积大且与本机环境绑定，禁止入库
+.tmp*/
+.uv-cache/
+.pnpm-store/
+travel-agent.tmp*/

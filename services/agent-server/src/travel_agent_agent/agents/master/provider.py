@@ -19,15 +19,37 @@ def disabled_sub_agent_factory(name: str) -> SubAgentFactory:
 
 
 def default_sub_agent_configs() -> tuple[SubAgentConfig, ...]:
-    """返回四个已确认子 Agent 的懒加载配置，不注册预订和报销 Agent。"""
-    names = (
-        "itinerary_manage_agent",
-        "itinerary_plan_agent",
-        "booking_agent",
-        "itinerary_review_agent",
-        "info_agent",
+    """返回五个可注册子 Agent 的懒加载配置，规划与审核保持禁用。"""
+    configs = (
+        SubAgentConfig(
+            "itinerary_manage_agent",
+            disabled_sub_agent_factory("itinerary_manage_agent"),
+            description="差旅单全生命周期管理：提交、查询、修改、取消出差申请与审批状态。",
+        ),
+        SubAgentConfig(
+            "booking_agent",
+            disabled_sub_agent_factory("booking_agent"),
+            description="机票、酒店、火车票查询与预订执行，以及已有预订的取消。",
+        ),
+        SubAgentConfig(
+            "info_agent",
+            disabled_sub_agent_factory("info_agent"),
+            description="差旅政策、景点、签证与目的地公共信息查询。",
+        ),
+        SubAgentConfig(
+            "itinerary_plan_agent",
+            disabled_sub_agent_factory("itinerary_plan_agent"),
+            enabled=False,
+            description="行程规划能力当前未接入。",
+        ),
+        SubAgentConfig(
+            "itinerary_review_agent",
+            disabled_sub_agent_factory("itinerary_review_agent"),
+            enabled=False,
+            description="行程审核能力当前未接入。",
+        ),
     )
-    return tuple(SubAgentConfig(name, disabled_sub_agent_factory(name)) for name in names)
+    return configs
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,15 +76,23 @@ SubAgentFactory = Callable[[], Callable[[SubAgentRequest], Awaitable[SubAgentRes
 
 @dataclass(frozen=True, slots=True)
 class SubAgentConfig:
-    """保存子 Agent 工具名、启用状态和延迟创建工厂。"""
+    """保存子 Agent 工具名、启用状态、工具说明和延迟创建工厂。"""
 
     key: str
     factory: SubAgentFactory
     enabled: bool = True
+    description: str = ""
+
+    @property
+    def tool_description(self) -> str:
+        """返回暴露给主模型的中文工具说明。"""
+        if self.description:
+            return self.description
+        return f"调用 {self.key} 处理对应的差旅子任务。"
 
 
 class SubAgentProvider:
-    """按工具名懒加载并缓存四个已登记子 Agent，拒绝未登记能力。"""
+    """按工具名懒加载并缓存已登记子 Agent，拒绝未登记或未启用能力。"""
 
     def __init__(self, configs: tuple[SubAgentConfig, ...]) -> None:
         """只保存配置，不在初始化阶段实例化任何子 Agent。"""
@@ -73,6 +103,11 @@ class SubAgentProvider:
     def loaded_keys(self) -> tuple[str, ...]:
         """返回已实际创建的子 Agent 工具名。"""
         return tuple(self._instances)
+
+    @property
+    def enabled_configs(self) -> tuple[SubAgentConfig, ...]:
+        """按注册顺序返回已启用的子 Agent 配置，供主模型工具注册使用。"""
+        return tuple(config for config in self._configs.values() if config.enabled)
 
     async def invoke(self, key: str, request: SubAgentRequest) -> SubAgentResult:
         """按 key 首次创建并调用子 Agent，后续复用同一实例。"""

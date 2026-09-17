@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.tools import StructuredTool
 
@@ -13,9 +14,6 @@ from travel_agent_agent.agents.common.session_context import (
     set_base_city,
     set_profile_status,
     set_travel_order_id,
-)
-from travel_agent_agent.agents.common.travel_order_read_tools import (
-    TravelOrderReadTools as SharedTravelOrderReadTools,
 )
 from travel_agent_agent.agents.itinerary_manage.client import TravelManageApiClient
 from travel_agent_agent.agents.itinerary_manage.date_normalizer import (
@@ -26,7 +24,6 @@ from travel_agent_agent.agents.itinerary_manage.hitl_context import (
     get_tool_execution_authorization,
 )
 from travel_agent_agent.agents.itinerary_manage.schemas import (
-    ApprovalStatusRecord,
     CancelTravelOrderRecord,
     ModifyTravelOrderRecord,
     SubmitTravelApprovalRecord,
@@ -51,18 +48,21 @@ class TravelOrderWriteTools:
         self.dates = TravelDateNormalizer()
 
     async def submit_travel_approval(self, payload: TravelOrderInput) -> SubmitTravelApprovalRecord:
-        """提交差旅单和审批单，幂等键由本次调用生成。"""
+        """提交差旅单和审批单；未提供单号时由服务端生成，幂等键取自确认交互。"""
+        order_id = payload.order_id or f"order_{uuid4().hex[:16]}"
         normalized = self._normalize_dates(payload.model_dump(exclude_none=True))
+        # 单号由服务端按幂等键生成，请求体里不补字段，避免与确认时的参数指纹不一致。
+        normalized.pop("order_id", None)
         existing = await self.client.request(
-            "GET", "/internal/v1/travel-orders", params={"order_id": payload.order_id}
+            "GET", "/internal/v1/travel-orders", params={"order_id": order_id}
         )
         existing_orders = existing.get("orders", [])
         if existing_orders:
             order = existing_orders[0]
-            set_travel_order_id(payload.order_id)
+            set_travel_order_id(order_id)
             return SubmitTravelApprovalRecord(
                 success=True,
-                order_id=order.get("order_id", payload.order_id),
+                order_id=order.get("order_id", order_id),
                 approval_id=order.get("approval_id"),
                 order_status=order.get("status", "UNKNOWN"),
                 approval_status="PENDING",
@@ -80,17 +80,17 @@ class TravelOrderWriteTools:
             idempotency_key=authorization.interaction_id,
         )
         order = result.get("order", {})
-        set_travel_order_id(payload.order_id)
+        set_travel_order_id(order_id)
         verification = await self.client.request(
             "GET",
             "/internal/v1/travel-orders",
-            params={"order_id": payload.order_id},
+            params={"order_id": order_id},
         )
         verified_order = verification.get("orders", [])
         verified = bool(verified_order) and verified_order[0].get("status") == "SUBMITTED"
         return SubmitTravelApprovalRecord(
             success=result.get("status") == "submitted",
-            order_id=order.get("order_id", payload.order_id),
+            order_id=order.get("order_id", order_id),
             approval_id=order.get("approval_id"),
             order_status=order.get("status", "UNKNOWN"),
             approval_status="PENDING",
@@ -141,24 +141,6 @@ class TravelOrderWriteTools:
             message="差旅申请已更新并重新提交审批。",
         )
 
-    async def query_approval_status(
-        self, process_instance_id: str | None = None
-    ) -> ApprovalStatusRecord:
-        """查询审批实例状态。"""
-        result = await self.client.request(
-            "GET", "/internal/v1/approvals", params={"process_instance_id": process_instance_id}
-        )
-        items = result.get("approvals", [])
-        item = items[0] if items else {}
-        return ApprovalStatusRecord(
-            found=bool(items),
-            process_instance_id=item.get("process_instance_id"),
-            order_id=item.get("order_id"),
-            status=item.get("status"),
-            latest=process_instance_id is None,
-            message="已返回审批状态。" if items else "未找到审批记录。",
-        )
-
     def as_tools(self) -> list[StructuredTool]:
         """将写工具适配为 LangChain 工具。"""
         return [
@@ -174,10 +156,6 @@ class TravelOrderWriteTools:
                 coroutine=self.modify_travel_order,
                 name="modify_travel_order",
                 description="修改差旅申请；必须先完成冲突检查并取得用户确认。",
-            ),
-            StructuredTool.from_function(
-                coroutine=self.query_approval_status, name="query_approval_status",
-                description="只读查询审批状态。",
             ),
         ]
 
@@ -248,32 +226,6 @@ class TravelOrderConflictTools:
         )]
 
 
-class _LegacyTravelOrderReadTools:
-    """提供差旅单只读查询。"""
-
-    def __init__(self, client: TravelManageApiClient) -> None:
-        self.client = client
-
-    def _legacy_shared_tools(self) -> list[StructuredTool]:
-        """兼容旧导出，实际只委托共享只读工具。"""
-        return SharedTravelOrderReadTools(self.client).as_tools()
-
-    async def query_travel_order(
-        self, order_id: str | None = None, status: str | None = None
-    ) -> dict[str, Any]:
-        """按 ID 或状态查询当前用户差旅单。"""
-        return await self.client.request(
-            "GET", "/internal/v1/travel-orders",
-            params={"order_id": order_id, "status": status},
-        )
-
-    def as_tools(self) -> list[StructuredTool]:
-        return [StructuredTool.from_function(
-            coroutine=self.query_travel_order, name="query_travel_order",
-            description="只读查询当前用户差旅单。",
-        )]
-
-
 class BookingReadTools:
     """提供机票、酒店和火车票内部预订记录查询。"""
 
@@ -281,18 +233,28 @@ class BookingReadTools:
         self.client = client
 
     async def query_booking_record(
-        self, booking_id: str | None = None, travel_order_id: str | None = None
+        self,
+        booking_id: str | None = None,
+        travel_order_id: str | None = None,
+        biz_type: str | None = None,
     ) -> dict[str, Any]:
-        """按预订号或差旅单号查询预订记录。"""
+        """按预订单号、差旅单号或业务类型查询预订记录。"""
         return await self.client.request(
             "GET", "/internal/v1/bookings",
-            params={"booking_id": booking_id, "travel_order_id": travel_order_id},
+            params={
+                "booking_id": booking_id,
+                "travel_order_id": travel_order_id,
+                "biz_type": biz_type,
+            },
         )
 
     def as_tools(self) -> list[StructuredTool]:
         return [StructuredTool.from_function(
             coroutine=self.query_booking_record, name="query_booking_record",
-            description="只读查询关联预订记录。",
+            description=(
+                "只读查询关联预订记录，可按预订单号、差旅单号或业务类型"
+                "（FLIGHT/HOTEL/TRAIN/TICKET/CRUISE/VACATION）过滤。"
+            ),
         )]
 
 
@@ -348,11 +310,30 @@ class PolicyTools:
         return result
 
     async def check_travel_policy(
-        self, city: str, amount: float | None = None
+        self,
+        city: str,
+        amount: float | None = None,
+        hotel_amount: float | None = None,
+        hotel_star: int | None = None,
+        flight_class: str | None = None,
+        train_seat_class: str | None = None,
+        daily_meal_amount: float | None = None,
+        daily_transport_amount: float | None = None,
+        departure_date: str | None = None,
     ) -> dict[str, Any]:
-        return await self.client.request(
-            "GET", "/internal/v1/policies", params={"city": city, "amount": amount}
-        )
+        """校验具体预订或费用参数，动态结果不写入会话缓存。"""
+        params = {
+            "city": city,
+            "amount": amount,
+            "hotel_amount": hotel_amount,
+            "hotel_star": hotel_star,
+            "flight_class": flight_class,
+            "train_seat_class": train_seat_class,
+            "daily_meal_amount": daily_meal_amount,
+            "daily_transport_amount": daily_transport_amount,
+            "departure_date": departure_date,
+        }
+        return await self.client.request("GET", "/internal/v1/policies", params=params)
 
     def as_tools(self) -> list[StructuredTool]:
         return [
@@ -413,8 +394,11 @@ class QueryUserInfoTools:
         set_profile_status(result.flight_complete, result.hotel_complete, result.train_complete)
         return result
 
-    async def query_user_base_location(self) -> UserBaseLocationRecord:
-        """读取当前用户常驻城市，缺失时只返回 found=false。"""
+    async def query_user_base_location(
+        self, user_id: str | None = None
+    ) -> UserBaseLocationRecord:
+        """读取当前用户常驻城市；入参用户标识仅占位，始终以会话身份为准。"""
+        del user_id
         context = get_session_context()
 
         async def load_location() -> str | None:
@@ -431,7 +415,7 @@ class QueryUserInfoTools:
             _log_cache_hit("base_location")
             result = UserBaseLocationRecord(
                 found=True,
-                base_city=cached,
+                baseCity=cached,
                 message="已找到用户常驻城市",
             )
         else:

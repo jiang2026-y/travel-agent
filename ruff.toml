@@ -1,6 +1,8 @@
 target-version = "py312"
 line-length = 100
 src = ["services/api-server/src", "services/agent-server/src", "services/tool-gateway/src"]
+# 随包分发的第三方技能脚本不参与本仓库静态检查。
+extend-exclude = ["services/agent-server/src/travel_agent_agent/skills"]
 
 [lint]
 select = ["E", "F", "I", "UP"]

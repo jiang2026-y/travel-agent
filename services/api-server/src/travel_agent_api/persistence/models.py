@@ -242,6 +242,36 @@ class ApprovalRecord(SQLModel, table=True):
     order_id: str | None = Field(default=None, max_length=64)
 
 
+class UserApiKey(SQLModel, table=True):
+    """保存用户级第三方 API Key 的 AES-GCM 密文，业务键为 (user_id, provider)。"""
+
+    __tablename__ = "user_api_key"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", name="uq_user_api_key_user_provider"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: str = Field(foreign_key="users.user_id", index=True, max_length=64)
+    provider: str = Field(max_length=64)
+    api_key_ciphertext: bytes = Field(
+        sa_column=Column("api_key_ciphertext", LargeBinary, nullable=False)
+    )
+    api_key_nonce: bytes = Field(
+        sa_column=Column("api_key_nonce", LargeBinary, nullable=False)
+    )
+    api_key_key_version: int = Field(default=1)
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(
+            DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+        ),
+    )
+
+
 class BookingRecord(SQLModel, table=True):
     """保存差旅关联的机票、酒店和火车票预订记录及内部状态。"""
 

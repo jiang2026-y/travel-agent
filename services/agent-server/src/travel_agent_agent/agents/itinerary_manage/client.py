@@ -11,7 +11,16 @@ from travel_agent_agent.agents.base import AgentContext
 
 
 class TravelManageApiError(RuntimeError):
-    """表示内部差旅 API 不可用或拒绝了请求。"""
+    """表示内部差旅 API 不可用或拒绝了请求，携带可展示的稳定错误码。"""
+
+    def __init__(
+        self, code: str, *, status_code: int | None = None, retryable: bool = False
+    ) -> None:
+        """保存错误码、上游状态与可重试标记，不保存响应正文。"""
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 class TravelManageApiClient:
@@ -66,10 +75,29 @@ class TravelManageApiClient:
                 response = await client.request(
                     method, path, headers=headers, params=params, json=body
                 )
-                response.raise_for_status()
-                data = response.json()
-        except (httpx.HTTPError, ValueError, OSError) as error:
-            raise TravelManageApiError("travel_api_unavailable") from error
+        except (httpx.HTTPError, OSError) as error:
+            raise TravelManageApiError("travel_api_unavailable", retryable=True) from error
+        if response.status_code >= 400:
+            raise TravelManageApiError(
+                _extract_error_code(response), status_code=response.status_code
+            )
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise TravelManageApiError("travel_api_response_invalid") from error
         if not isinstance(data, dict):
             raise TravelManageApiError("travel_api_response_invalid")
         return data
+
+
+def _extract_error_code(response: httpx.Response) -> str:
+    """从内部错误信封读取稳定错误码，读取失败时回退到通用服务错误码。"""
+    try:
+        body = response.json()
+    except ValueError:
+        return "travel_api_unavailable"
+    error = body.get("error") if isinstance(body, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, str) and code:
+        return code[:64]
+    return "travel_api_unavailable"

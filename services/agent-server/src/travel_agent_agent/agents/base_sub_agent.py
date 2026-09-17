@@ -2,6 +2,8 @@
 # 定义 BaseSubAgent，负责上下文、内部客户端和共享 TravelOrderReadTools 装配。
 from __future__ import annotations
 
+from langchain_core.tools import StructuredTool
+
 from travel_agent_agent.agents.base import AgentContext
 from travel_agent_agent.agents.common.session_context import SessionCtx
 from travel_agent_agent.agents.common.travel_order_read_tools import TravelOrderReadTools
@@ -26,6 +28,6 @@ class BaseSubAgent:
         )
         self.travel_order_read_tools = TravelOrderReadTools(self.client)
 
-    def shared_read_tools(self) -> list[object]:
+    def shared_read_tools(self) -> list[StructuredTool]:
         """返回共享的单一差旅单查询工具。"""
         return list(self.travel_order_read_tools.as_tools())

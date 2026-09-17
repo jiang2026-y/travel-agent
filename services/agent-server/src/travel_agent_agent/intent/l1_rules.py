@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from travel_agent_agent.intent.catalog import get_intent_definition
 from travel_agent_agent.intent.l0_guard import StrongConjunctionGuard

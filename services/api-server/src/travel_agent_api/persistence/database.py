@@ -56,5 +56,6 @@ def model_registry() -> dict[str, Any]:
         "TravelOrder",
         "ApprovalRecord",
         "BookingRecord",
+        "UserApiKey",
     )
     return {name: getattr(_models, name) for name in model_names}

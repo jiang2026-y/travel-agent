@@ -13,6 +13,6 @@ def test_health_reports_dashscope_readonly() -> None:
     assert response.json() == {
         "service": "tool-gateway",
         "status": "ok",
-        "external_capabilities": "dashscope_readonly_only",
-        "provider_count": 1,
+        "external_capabilities": "readonly_providers_registered",
+        "provider_count": 5,
     }

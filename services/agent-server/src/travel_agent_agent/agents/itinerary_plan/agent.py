@@ -28,14 +28,14 @@ class ItineraryPlanAgent(BaseSubAgent):
         settings: Settings,
         context: AgentContext,
         *,
-        checkpointer: BaseCheckpointSaver | None = None,
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
     ) -> None:
         """装配共享只读工具和规划提示词。"""
         super().__init__(settings, context)
         self.profile_tools = QueryUserInfoTools(self.client)
         self.graph = create_agent(
             model=model,
-            tools=[*self.shared_read_tools(), *self.profile_tools.base_location_tools()],
+            tools=list([*self.shared_read_tools(), *self.profile_tools.base_location_tools()]),
             system_prompt=load_prompt("prompts/itinerary-manage-agent-system.md"),
             checkpointer=checkpointer,
             name="itineraryPlanAgent",

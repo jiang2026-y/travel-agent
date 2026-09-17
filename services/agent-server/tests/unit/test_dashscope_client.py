@@ -1,5 +1,6 @@
 # 本文件验证 Agent 的百炼批量 embedding 适配器。
-# 定义 test_embedding_client_batches_and_reorders_results，用于验证最多十条请求、敏感信息脱敏和按 index 还原向量。
+# 定义 test_embedding_client_batches_and_reorders_results，
+# 用于验证最多十条请求、敏感信息脱敏和按 index 还原向量。
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +12,7 @@ import pytest
 from travel_agent_agent.core.settings import Settings
 from travel_agent_agent.infrastructure.dashscope_client import (
     DashScopeEmbeddingClient,
+    DashScopeGatewayError,
     DashScopeRewriteClient,
     _ToolGatewayClient,
 )
@@ -59,7 +61,10 @@ async def _fenced_rewrite_gateway_response() -> dict[str, object]:
     return {
         "choices": [{
             "message": {
-                "content": '```json\n{"related": false, "rewritten_question": "请查询北京航班", "reason": "保持原意"}\n```'
+                "content": (
+                    '```json\n{"related": false, "rewritten_question": "请查询北京航班",'
+                    ' "reason": "保持原意"}\n```'
+                )
             }
         }]
     }
@@ -84,3 +89,39 @@ async def test_rewrite_client_extracts_question_from_fenced_json() -> None:
     result = await DashScopeRewriteClient(_RewriteGateway()).rewrite("查航班", "")  # type: ignore[arg-type]
 
     assert result == "请查询北京航班"
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_preserves_safe_quota_error(tmp_path) -> None:
+    """Agent 网关客户端应保留稳定额度错误码，不降级成不可操作的泛化异常。"""
+    token_file = tmp_path / "agent_gateway_internal_token"
+    token_file.write_text("g" * 32, encoding="utf-8")
+    settings = Settings.from_environment(
+        {
+            "TRAVEL_AGENT_ENV": "development",
+            "TRAVEL_AGENT_EXTERNAL_MODE": "real_readonly",
+            "AGENT_GATEWAY_INTERNAL_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """模拟 Tool Gateway 已完成脱敏的额度错误。"""
+        del request
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": "百炼模型额度已耗尽，请恢复额度后重试。",
+                    "type": "dashscope_quota_exhausted",
+                    "code": "dashscope_quota_exhausted",
+                    "retryable": False,
+                }
+            },
+        )
+
+    gateway = _ToolGatewayClient(settings, transport=httpx.MockTransport(handler))
+    with pytest.raises(DashScopeGatewayError) as exc_info:
+        await gateway.post("/internal/v1/dashscope/chat-completions", {"value": "safe"})
+
+    assert exc_info.value.code == "dashscope_quota_exhausted"
+    assert exc_info.value.retryable is False

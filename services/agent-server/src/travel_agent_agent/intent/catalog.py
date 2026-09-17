@@ -30,9 +30,10 @@ INTENT_CATALOG: dict[str, IntentDefinition] = {
     "itinerary_planning": IntentDefinition(
         "itinerary_planning", "itineraryPlanAgent", "行程规划"
     ),
-    "flight_search": IntentDefinition("flight_search", "itineraryPlanAgent", "航班查询"),
-    "train_search": IntentDefinition("train_search", "itineraryPlanAgent", "火车查询"),
-    "hotel_search": IntentDefinition("hotel_search", "itineraryPlanAgent", "酒店查询"),
+    # 行程规划智能体未接入，实时交通与住宿查询统一由预订智能体承担。
+    "flight_search": IntentDefinition("flight_search", "bookingAgent", "航班查询"),
+    "train_search": IntentDefinition("train_search", "bookingAgent", "火车查询"),
+    "hotel_search": IntentDefinition("hotel_search", "bookingAgent", "酒店查询"),
     "booking": IntentDefinition("booking", "bookingAgent", "预订处理"),
     "reimbursement": IntentDefinition("reimbursement", "masterAgent", "报销咨询"),
     "policy_query": IntentDefinition("policy_query", "infoAgent", "差旅政策查询"),

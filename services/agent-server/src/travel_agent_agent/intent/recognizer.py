@@ -72,7 +72,9 @@ class IntentRecognizer:
                 rewritten = ""
             if rewritten:
                 diagnostics["rewrite_changed"] = rewritten != original.strip()
-                second, _ = await self._short_circuit(rewritten, trace_id, diagnostics, "rewritten_")
+                second, _ = await self._short_circuit(
+                    rewritten, trace_id, diagnostics, "rewritten_"
+                )
                 if second is not None:
                     return self._with_diagnostics(second, diagnostics), rewritten
                 original = rewritten
@@ -116,7 +118,9 @@ class IntentRecognizer:
         return None, True
 
     @staticmethod
-    def _with_diagnostics(result: IntentRecognitionResult, diagnostics: dict[str, object]) -> IntentRecognitionResult:
+    def _with_diagnostics(
+        result: IntentRecognitionResult, diagnostics: dict[str, object]
+    ) -> IntentRecognitionResult:
         """仅附加诊断字段，不改变原有识别和路由结果。"""
         payload = dict(diagnostics)
         payload["final"] = {

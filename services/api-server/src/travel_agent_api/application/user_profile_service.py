@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from travel_agent_api.core.encryption import DataEncryptionService, EncryptedPayload
+from travel_agent_api.persistence.database import metadata
 from travel_agent_api.persistence.models import User
 
 _SENSITIVE_FIELDS = frozenset(
@@ -100,8 +101,9 @@ class UserProfileService:
 
     async def _find_user(self, session: AsyncSession, user_id: str) -> User:
         """按当前认证用户身份读取未停用档案。"""
+        users = metadata.tables["users"].c
         user = await session.scalar(
-            select(User).where(User.user_id == user_id, User.disabled_at.is_(None))
+            select(User).where(users.user_id == user_id, users.disabled_at.is_(None))
         )
         if user is None:
             raise UserProfileError("profile_not_found")

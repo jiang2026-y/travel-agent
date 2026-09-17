@@ -6,12 +6,17 @@ import secrets
 from datetime import date
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from travel_agent_api.api.errors import ServiceError
 from travel_agent_api.application.travel_order_service import TravelOrderPersistenceService
+from travel_agent_api.application.travel_policy_service import (
+    PolicyServiceError,
+    TravelPolicyService,
+)
 from travel_agent_api.application.user_profile_service import UserProfileError, UserProfileService
 from travel_agent_api.core.correlation import get_correlation_context
 from travel_agent_api.infrastructure.agent_client import (
@@ -20,6 +25,7 @@ from travel_agent_api.infrastructure.agent_client import (
     InternalUserContext,
 )
 from travel_agent_api.persistence.models import ApprovalRecord, BookingRecord, TravelOrder
+from travel_agent_api.persistence.services import PostgresUserApiKeyService
 
 router = APIRouter(prefix="/internal/v1", tags=["internal-travel"])
 
@@ -77,6 +83,46 @@ class UserBaseLocationUpdatePayload(BaseModel):
     base_city: str = Field(min_length=1, max_length=128)
 
 
+class BookingCreatePayload(BaseModel):
+    """校验 Agent 保存 Provider 成功结果所需的脱敏订单字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+    booking_id: str = Field(min_length=1, max_length=64)
+    travel_order_id: str | None = Field(default=None, max_length=64)
+    biz_type: str = Field(min_length=1, max_length=16)
+    platform: str = Field(default="TUNIU", max_length=32)
+    external_order_no: str | None = Field(default=None, max_length=128)
+    status: str = Field(default="PAYMENT_PENDING", max_length=32)
+    external_status: str | None = Field(default=None, max_length=64)
+    payment_status: str | None = Field(default="PENDING", max_length=32)
+    title: str | None = Field(default=None, max_length=256)
+    total_amount: float | None = None
+    currency: str = Field(default="CNY", max_length=8)
+    contact_name: str | None = Field(default=None, max_length=64)
+    contact_phone: str | None = Field(default=None, max_length=32)
+    detail: dict[str, Any] = Field(default_factory=dict)
+    remark: str | None = Field(default=None, max_length=512)
+
+
+class BookingWriteAuthorizationPayload(BaseModel):
+    """校验途牛写操作在外部调用前消费确认凭证所需的最小上下文。"""
+
+    model_config = ConfigDict(extra="forbid")
+    tool_name: str = Field(pattern=r"^(create_tuniu_(flight|train|hotel)_order|cancel_booking)$")
+    order_args: str = Field(min_length=2, max_length=20000)
+    travel_order_id: str | None = Field(default=None, max_length=64)
+
+
+class ApiKeySavePayload(BaseModel):
+    """校验用户提交的第三方 API Key，仅保存密文。"""
+
+    model_config = ConfigDict(extra="forbid")
+    api_key: str = Field(min_length=8, max_length=512)
+
+
+_API_KEY_PROVIDERS = ("tuniu-cli", "flight-manager")
+
+
 async def require_agent_call(
     request: Request,
     authorization: str | None = Header(default=None),
@@ -111,6 +157,14 @@ def _profile_service(request: Request) -> UserProfileService:
     if service is None:
         raise ServiceError("persistence_not_enabled", "持久化服务尚未启用", False, 503)
     return cast(UserProfileService, service)
+
+
+def _policy_service(request: Request) -> TravelPolicyService:
+    """获取政策查询服务，未启用持久化时明确拒绝。"""
+    service = getattr(request.app.state, "travel_policy_service", None)
+    if service is None:
+        raise ServiceError("persistence_not_enabled", "持久化服务尚未启用", False, 503)
+    return cast(TravelPolicyService, service)
 
 
 async def _record_profile_audit(
@@ -204,7 +258,9 @@ async def submit_travel_order(
         and payload.return_date < payload.departure_date
     ):
         raise ServiceError("invalid_date_range", "返程日期不能早于出发日期", False, 422)
+    # 入库保留原始类型；确认校验单独用 JSON 模式导出（日期转 ISO 字符串）。
     request_payload = payload.model_dump(exclude_none=True)
+    authorization_args = payload.model_dump(mode="json", exclude_none=True)
     data = dict(request_payload)
     data.pop("order_id", None)
     if not x_conversation_id:
@@ -216,14 +272,16 @@ async def submit_travel_order(
         interaction_id=x_hitl_interaction_id,
         conversation_id=x_conversation_id,
         tool_name="submit_travel_approval",
-        tool_args={"payload": request_payload},
+        tool_args={"payload": authorization_args},
     )
     if x_idempotency_key and x_idempotency_key != idempotency_key:
         raise ServiceError("idempotency_key_mismatch", "幂等键校验失败", False, 403)
+    # 单号面向用户展示：未显式传入时生成可读单号，确认交互标识只用于幂等与审计。
+    order_id = payload.order_id or f"order_{uuid4().hex[:16]}"
     order = await _service(request).submit(
         user_id=identity["user_id"],
         payload=data,
-        idempotency_key=payload.order_id or idempotency_key,
+        idempotency_key=order_id,
     )
     return {"order": _order_payload(order), "status": "submitted"}
 
@@ -234,12 +292,14 @@ async def list_travel_orders(
     identity: dict[str, str] = Depends(require_agent_call),
     status: str | None = None,
     order_id: str | None = None,
+    departure_city: str | None = None,
+    destination: str | None = None,
     departure_date_from: date | None = None,
     departure_date_to: date | None = None,
     return_date_from: date | None = None,
     return_date_to: date | None = None,
 ) -> dict[str, Any]:
-    """按当前用户查询差旅单，管理员暂不开放跨用户筛选。"""
+    """按当前用户查询差旅单，支持状态、行程要素与日期区间筛选。"""
     service = _service(request)
     if order_id:
         order = await service.get_order(identity["user_id"], order_id)
@@ -248,15 +308,22 @@ async def list_travel_orders(
     orders = [
         item
         for item in orders
-        if _matches_date_range(
-            item,
-            departure_date_from,
-            departure_date_to,
-            return_date_from,
-            return_date_to,
+        if _matches_city(item.departure_city, departure_city)
+        and _matches_city(item.destination, destination)
+        and _matches_date_range(
+            item, departure_date_from, departure_date_to, return_date_from, return_date_to
         )
     ]
     return {"orders": [_order_payload(item) for item in orders]}
+
+
+def _matches_city(value: str | None, expected: str | None) -> bool:
+    """按去除空白后的精确城市名匹配，未指定筛选时一律通过。"""
+    if expected is None or not expected.strip():
+        return True
+    if value is None:
+        return False
+    return value.strip() == expected.strip()
 
 
 def _matches_date_range(
@@ -336,7 +403,9 @@ async def modify_travel_order(
     x_conversation_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """修改差旅单、撤销旧待审批实例并创建新的审批快照。"""
+    # 入库保留原始类型；确认校验单独使用 JSON 可序列化的副本。
     request_payload = payload.model_dump(exclude_none=True)
+    authorization_args = payload.model_dump(mode="json", exclude_none=True)
     data = dict(request_payload)
     data.pop("order_id", None)
     if not x_conversation_id:
@@ -348,7 +417,7 @@ async def modify_travel_order(
         interaction_id=x_hitl_interaction_id,
         conversation_id=x_conversation_id,
         tool_name="modify_travel_order",
-        tool_args={"order_id": order_id, "payload": request_payload},
+        tool_args={"order_id": order_id, "payload": authorization_args},
     )
     try:
         order = await _service(request).modify(
@@ -429,12 +498,95 @@ async def list_bookings(
     identity: dict[str, str] = Depends(require_agent_call),
     travel_order_id: str | None = None,
     booking_id: str | None = None,
+    biz_type: str | None = None,
 ) -> dict[str, Any]:
     """按用户和差旅关联条件查询预订记录。"""
     rows = await _service(request).list_bookings(
-        identity["user_id"], travel_order_id=travel_order_id, booking_id=booking_id
+        identity["user_id"],
+        travel_order_id=travel_order_id,
+        booking_id=booking_id,
+        biz_type=biz_type,
     )
     return {"bookings": [_booking_payload(item) for item in rows]}
+
+
+@router.post("/bookings")
+async def create_booking(
+    payload: BookingCreatePayload,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+    x_idempotency_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """仅供 Agent 在 Provider 成功后保存脱敏订单结果，浏览器不可直接调用。"""
+    idempotency_key = x_idempotency_key or payload.booking_id
+    if idempotency_key != payload.booking_id:
+        raise ServiceError("idempotency_key_mismatch", "幂等键与订单号不一致", False, 403)
+    booking = await _service(request).upsert_booking(
+        user_id=identity["user_id"],
+        payload=payload.model_dump(exclude_none=True),
+        idempotency_key=idempotency_key,
+    )
+    return {"booking": _booking_payload(booking), "status": "saved"}
+
+
+@router.post("/bookings/write-authorization")
+async def authorize_booking_write(
+    payload: BookingWriteAuthorizationPayload,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+    x_confirmation_token: str | None = Header(default=None),
+    x_hitl_interaction_id: str | None = Header(default=None),
+    x_conversation_id: str | None = Header(default=None),
+) -> dict[str, str]:
+    """确认差旅审批已通过后，原子消费一次性凭证并返回预订幂等键。"""
+    if payload.tool_name == "cancel_booking":
+        if not payload.travel_order_id:
+            records = await _service(request).list_bookings(
+                identity["user_id"], booking_id=payload.order_args
+            )
+            if not records:
+                raise ServiceError("booking_not_found", "预订记录不存在", False, 404)
+            payload = payload.model_copy(update={"travel_order_id": records[0].travel_order_id})
+    else:
+        order = await _service(request).get_order(
+            identity["user_id"], payload.travel_order_id or ""
+        )
+        if order is None:
+            raise ServiceError("travel_order_not_found", "关联差旅单不存在", False, 404)
+        if str(order.status) != "APPROVED":
+            raise ServiceError(
+                "travel_order_not_approved", "差旅单尚未审批通过，不能预订", False, 409
+            )
+    idempotency_key = await _consume_write_authorization(
+        request,
+        identity,
+        confirmation_token=x_confirmation_token,
+        interaction_id=x_hitl_interaction_id,
+        conversation_id=x_conversation_id,
+        tool_name=payload.tool_name,
+        tool_args=(
+            {"booking_id": payload.order_args}
+            if payload.tool_name == "cancel_booking"
+            else {"order_args": payload.order_args}
+        ),
+    )
+    return {"idempotency_key": idempotency_key}
+
+
+@router.post("/bookings/{booking_id}/provider-cancelled")
+async def mark_provider_cancelled(
+    booking_id: str,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+) -> dict[str, Any]:
+    """Provider 成功取消后更新内部订单，避免外部失败时修改本地状态。"""
+    bookings = await _service(request).list_bookings(identity["user_id"], booking_id=booking_id)
+    if not bookings:
+        raise ServiceError("booking_not_found", "预订记录不存在", False, 404)
+    booking = await _service(request).cancel_booking(identity["user_id"], booking_id)
+    if booking is None:
+        raise ServiceError("booking_not_found", "预订记录不存在", False, 404)
+    return {"booking": _booking_payload(booking), "status": "booking_cancelled"}
 
 
 @router.post("/bookings/{booking_id}/cancel")
@@ -472,13 +624,43 @@ async def cancel_booking(
 
 @router.get("/policies")
 async def query_policy(
+    request: Request,
     city: str,
     identity: dict[str, str] = Depends(require_agent_call),
     amount: float | None = None,
+    hotel_amount: float | None = None,
+    hotel_star: int | None = None,
+    flight_class: str | None = None,
+    train_seat_class: str | None = None,
+    daily_meal_amount: float | None = None,
+    daily_transport_amount: float | None = None,
+    departure_date: date | None = None,
 ) -> dict[str, Any]:
-    """返回当前版本的只读政策占位，后续接入政策表与会话缓存。"""
-    del identity
-    return {"city": city, "amount": amount, "policy": None, "status": "not_configured"}
+    """查询当前用户政策；提供动态参数时同时返回合规校验结果。"""
+    values = {
+        "amount": amount,
+        "hotel_amount": hotel_amount,
+        "hotel_star": hotel_star,
+        "flight_class": flight_class,
+        "train_seat_class": train_seat_class,
+        "daily_meal_amount": daily_meal_amount,
+        "daily_transport_amount": daily_transport_amount,
+        "departure_date": departure_date,
+    }
+    try:
+        result = await _policy_service(request).check_policy(identity["user_id"], city, values)
+    except PolicyServiceError as error:
+        if str(error) == "profile_not_found":
+            raise ServiceError("profile_not_found", "未找到用户档案", False, 404) from error
+        if str(error) == "profile_incomplete":
+            raise ServiceError(
+                "profile_incomplete", "缺少有效职级，无法匹配差旅政策", False, 422
+            ) from error
+        if str(error) == "city_required":
+            raise ServiceError("city_required", "缺少目的地城市", False, 422) from error
+        raise ServiceError("policy_not_found", "未找到匹配的差旅政策", False, 404) from error
+    result["city"] = city
+    return result
 
 
 @router.get("/users/contact")
@@ -563,7 +745,78 @@ def _booking_payload(item: BookingRecord) -> dict[str, Any]:
         "travel_order_id": item.travel_order_id,
         "biz_type": item.biz_type,
         "platform": item.platform,
+        "external_order_no": item.external_order_no,
         "status": item.status,
+        "external_status": item.external_status,
+        "payment_status": item.payment_status,
         "title": item.title,
         "total_amount": str(item.total_amount) if item.total_amount is not None else None,
+        "payment_url": item.detail.get("payment_url") if isinstance(item.detail, dict) else None,
     }
+
+
+@router.get("/users/api-keys/{provider}")
+async def get_api_key_status(
+    provider: str,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+) -> dict[str, Any]:
+    """只返回当前用户是否已配置指定 provider 的 API Key，不回显任何密钥内容。"""
+    _require_api_key_provider(provider)
+    service = _api_key_service(request)
+    return {
+        "provider": provider,
+        "has_key": await service.has_key(identity["user_id"], provider),
+    }
+
+
+@router.get("/users/api-keys/{provider}/reveal")
+async def reveal_api_key(
+    provider: str,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+) -> dict[str, Any]:
+    """返回明文密钥供 Agent 注入 CLI；必须写审计且不缓存、不记录正文。"""
+    _require_api_key_provider(provider)
+    service = _api_key_service(request)
+    api_key = await service.reveal(identity["user_id"], provider)
+    if api_key is None:
+        await _record_profile_audit(
+            request, identity["user_id"], f"api_key_reveal:{provider}", "missing", []
+        )
+        raise ServiceError("api_key_not_configured", "尚未配置该服务的 API Key", False, 404)
+    await _record_profile_audit(
+        request, identity["user_id"], f"api_key_reveal:{provider}", "success", []
+    )
+    return {"provider": provider, "api_key": api_key}
+
+
+@router.put("/users/api-keys/{provider}")
+async def save_api_key(
+    provider: str,
+    payload: ApiKeySavePayload,
+    request: Request,
+    identity: dict[str, str] = Depends(require_agent_call),
+) -> dict[str, Any]:
+    """加密保存用户提交的 API Key，审计只记录 provider 与结果。"""
+    _require_api_key_provider(provider)
+    service = _api_key_service(request)
+    await service.save(identity["user_id"], provider, payload.api_key.strip())
+    await _record_profile_audit(
+        request, identity["user_id"], f"api_key_save:{provider}", "success", []
+    )
+    return {"provider": provider, "status": "saved"}
+
+
+def _require_api_key_provider(provider: str) -> None:
+    """只允许已登记的 provider，避免任意键名写入。"""
+    if provider not in _API_KEY_PROVIDERS:
+        raise ServiceError("api_key_provider_not_registered", "不支持的 API Key 服务", False, 404)
+
+
+def _api_key_service(request: Request) -> PostgresUserApiKeyService:
+    """读取用户 API Key 服务；未启用持久化时明确拒绝。"""
+    service = getattr(request.app.state, "user_api_key_service", None)
+    if service is None:
+        raise ServiceError("persistence_not_enabled", "持久化服务尚未启用", False, 503)
+    return cast(PostgresUserApiKeyService, service)

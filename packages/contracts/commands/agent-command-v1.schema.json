@@ -7,6 +7,7 @@
     { "$ref": "#/$defs/StartCommand" },
     { "$ref": "#/$defs/ResumeCommand" },
     { "$ref": "#/$defs/CancelCommand" },
+    { "$ref": "#/$defs/RecommendationCommand" },
     { "$ref": "#/$defs/SuspendUserMemoryCommand" }
   ],
   "$defs": {
@@ -83,7 +84,8 @@
             "run_id": { "$ref": "#/$defs/Identifier" },
             "thread_id": { "$ref": "#/$defs/Identifier" },
             "task_brief": { "type": "string", "minLength": 1, "maxLength": 8000 },
-            "context_summary": { "type": "string", "maxLength": 2000 }
+            "context_summary": { "type": "string", "maxLength": 2000 },
+            "quick_action": { "type": "string", "maxLength": 32 }
           }
         }
       ]
@@ -104,6 +106,32 @@
             "conversation_id": { "$ref": "#/$defs/Identifier" },
             "run_id": { "$ref": "#/$defs/Identifier" },
             "thread_id": { "$ref": "#/$defs/Identifier" }
+          }
+        }
+      ]
+    },
+    "RecommendationCommand": {
+      "allOf": [
+        { "$ref": "#/$defs/CommandBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "conversation_id", "run_id", "thread_id", "user_question", "assistant_reply", "answer_version", "run_status"],
+          "properties": {
+            "command_version": { "const": "v1" },
+            "request_id": { "$ref": "#/$defs/Identifier" },
+            "trace_id": { "$ref": "#/$defs/Identifier" },
+            "user": { "$ref": "#/$defs/UserContext" },
+            "command": { "const": "recommendations" },
+            "conversation_id": { "$ref": "#/$defs/Identifier" },
+            "run_id": { "$ref": "#/$defs/Identifier" },
+            "thread_id": { "$ref": "#/$defs/Identifier" },
+            "user_question": { "type": "string", "minLength": 1, "maxLength": 8000 },
+            "assistant_reply": { "type": "string", "minLength": 1, "maxLength": 16000 },
+            "context_summary": { "type": "string", "maxLength": 2000 },
+            "answer_version": { "$ref": "#/$defs/Identifier" },
+            "run_status": { "enum": ["proposed", "running", "clarifying", "awaiting_approval", "completed", "failed", "cancelled"] },
+            "has_pending_interaction": { "type": "boolean" }
           }
         }
       ]

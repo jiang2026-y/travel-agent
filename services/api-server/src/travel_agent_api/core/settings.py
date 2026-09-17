@@ -66,8 +66,10 @@ class Settings:
     cors_allowed_origins: tuple[str, ...]
     agent_server_base_url: str
     api_agent_token_file: str
+    run_command_timeout_seconds: float
     provider_registration: ProviderRegistration
     provider_approved: bool
+    tuniu_approved: bool = False
 
     @property
     def provider_call_enabled(self) -> bool:
@@ -80,8 +82,8 @@ class Settings:
         values = environ or os.environ
         environment = values.get("TRAVEL_AGENT_ENV", "development")
         external_mode = values.get("TRAVEL_AGENT_EXTERNAL_MODE", "real_readonly")
-        if external_mode != "real_readonly":
-            raise ValueError("external_mode_must_be_real_readonly")
+        if external_mode not in {"real_readonly", "real_tuniu"}:
+            raise ValueError("external_mode_invalid")
         session_cookie_secure = _read_bool(
             values, "TRAVEL_AGENT_COOKIE_SECURE", default=environment == "production"
         )
@@ -141,6 +143,9 @@ class Settings:
             api_agent_token_file=values.get(
                 "API_AGENT_INTERNAL_TOKEN_FILE", "/run/secrets/api_agent_internal_token"
             ),
+            run_command_timeout_seconds=_read_positive_float(
+                values, "TRAVEL_AGENT_RUN_COMMAND_TIMEOUT_SECONDS", default=600.0
+            ),
             provider_registration=ProviderRegistration(
                 provider_key=values.get("TRAVEL_AGENT_PROVIDER_KEY", ""),
                 version=values.get("TRAVEL_AGENT_PROVIDER_VERSION", ""),
@@ -148,6 +153,7 @@ class Settings:
                 secret_ref=values.get("TRAVEL_AGENT_PROVIDER_SECRET_REF", ""),
             ),
             provider_approved=_read_bool(values, "TRAVEL_AGENT_PROVIDER_APPROVED", default=False),
+            tuniu_approved=_read_bool(values, "TRAVEL_AGENT_TUNIU_APPROVED", default=False),
         )
 
     def require_readonly_provider(self) -> ProviderRegistration:
@@ -169,6 +175,20 @@ def _read_bool(values: Mapping[str, str], key: str, default: bool) -> bool:
     if normalized in {"false", "0"}:
         return False
     raise ValueError(f"{key.lower()}_must_be_boolean")
+
+
+def _read_positive_float(values: Mapping[str, str], key: str, default: float) -> float:
+    """读取正浮点环境变量，用于执行类内部命令的超时预算。"""
+    value = values.get(key)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{key.lower()}_must_be_positive_number") from error
+    if parsed <= 0:
+        raise ValueError(f"{key.lower()}_must_be_positive_number")
+    return parsed
 
 
 def _read_origins(raw_origins: str) -> tuple[str, ...]:

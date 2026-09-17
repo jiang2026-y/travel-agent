@@ -8,5 +8,10 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 5173,
+    // Docker Desktop 的 Windows 挂载点收不到 inotify 事件，必须轮询才能热更新。
+    watch: {
+      usePolling: true,
+      interval: 300,
+    },
   },
 });

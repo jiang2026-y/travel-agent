@@ -27,10 +27,16 @@ def upgrade() -> None:
         sa.Column("approval_id", sa.String(64)),
         sa.Column("plan_html_url", sa.String(512)),
         sa.Column(
-            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
         ),
         sa.Column(
-            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
         ),
         sa.CheckConstraint(
             "status IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','COMPLETED','CANCELLED')",
@@ -90,10 +96,16 @@ def upgrade() -> None:
         sa.Column("remark", sa.String(512)),
         sa.Column("booked_at", sa.DateTime(timezone=True)),
         sa.Column(
-            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
         ),
         sa.Column(
-            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
         ),
         sa.Column("deleted", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.CheckConstraint(

@@ -66,6 +66,7 @@ def route_from_recognition(
         recognition.multi_intent
         or recognized.confidence.value != "high"
         or recognized.intent == "unknown"
+        or recognized.target_agent == "itineraryPlanAgent"
     ):
         return (
             RunRoute(

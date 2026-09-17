@@ -152,3 +152,59 @@ def test_embedding_endpoint_requires_internal_token_and_uses_fixed_provider_path
     assert denied.status_code == 401
     assert response.status_code == 200
     assert len(response.json()["data"][0]["embedding"]) == 1024
+
+
+def test_dashscope_quota_error_is_mapped_without_exposing_upstream_body(tmp_path) -> None:
+    """百炼额度不足必须映射为稳定错误码，且不得透传上游正文或请求标识。"""
+    gateway_token_file = tmp_path / "agent_gateway_internal_token"
+    api_key_file = tmp_path / "dashscope_api_key"
+    gateway_token_file.write_text("g" * 32, encoding="utf-8")
+    api_key_file.write_text("k" * 32, encoding="utf-8")
+    settings = GatewaySettings(
+        dashscope_api_key_file=str(api_key_file),
+        agent_gateway_token_file=str(gateway_token_file),
+    )
+    registry = _dashscope_registry(settings)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """模拟百炼返回包含敏感诊断文本的额度不足响应。"""
+        del request
+        return httpx.Response(
+            403,
+            json={
+                "error": {
+                    "message": "Free quota exhausted for secret account",
+                    "type": "insufficient_quota",
+                    "code": "insufficient_quota",
+                },
+                "request_id": "upstream-request-id",
+            },
+        )
+
+    restricted_client = RestrictedHttpClient(registry, transport=httpx.MockTransport(handler))
+    application = create_app(registry=registry, settings=settings, client=restricted_client)
+    with TestClient(application) as client:
+        response = client.post(
+            "/internal/v1/dashscope/chat-completions",
+            headers={"Authorization": f"Bearer {'g' * 32}"},
+            json={
+                "model": "glm-5.1",
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "question"},
+                ],
+                "temperature": 0,
+            },
+        )
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "error": {
+            "message": "百炼模型额度已耗尽，请恢复额度后重试。",
+            "type": "dashscope_quota_exhausted",
+            "code": "dashscope_quota_exhausted",
+            "retryable": False,
+        }
+    }
+    assert "Free quota" not in response.text
+    assert "upstream-request-id" not in response.text

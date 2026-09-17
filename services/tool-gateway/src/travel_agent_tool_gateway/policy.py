@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+_PATH_PARAM_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,31}$")
+_PLACEHOLDER_PATTERN = re.compile(r"\{([a-z_][a-z0-9_]{0,31})\}")
 
 
 class ToolPolicyDenied(RuntimeError):
@@ -20,6 +24,7 @@ class OperationDefinition:
     method: str
     path: str
     read_only: bool
+    allowed_query_params: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """校验操作标识、HTTP 方法与相对路径。"""
@@ -29,6 +34,19 @@ class OperationDefinition:
             raise ValueError("method_not_supported")
         if not self.path.startswith("/") or "//" in self.path:
             raise ValueError("operation_path_invalid")
+        for name in _PLACEHOLDER_PATTERN.findall(self.path):
+            if _PATH_PARAM_PATTERN.fullmatch(name) is None:
+                raise ValueError("operation_path_param_invalid")
+
+    @property
+    def path_params(self) -> tuple[str, ...]:
+        """返回路径中声明的占位参数名，调用方必须逐一提供。"""
+        return path_placeholders(self.path)
+
+
+def path_placeholders(template: str) -> tuple[str, ...]:
+    """返回路径模板中出现的占位参数名，保持出现顺序。"""
+    return tuple(_PLACEHOLDER_PATTERN.findall(template))
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +57,8 @@ class ProviderDefinition:
     base_url: str
     allowed_hosts: tuple[str, ...]
     operations: tuple[OperationDefinition, ...]
+    # 默认拒绝写操作；仅当 Provider 明确声明时才允许其已登记的非只读操作。
+    allows_registered_writes: bool = False
 
     def __post_init__(self) -> None:
         """校验 Provider 只使用 HTTPS，且基地址主机位于精确白名单中。"""
@@ -92,5 +112,17 @@ class ProviderRegistry:
             raise ToolPolicyDenied("provider_not_registered")
         operation = provider.get_operation(operation_key)
         if not operation.read_only:
+            raise ToolPolicyDenied("write_operation_denied")
+        return AuthorizedOperation(provider=provider, operation=operation)
+
+    def authorize_write(self, provider_key: str, operation_key: str) -> AuthorizedOperation:
+        """仅放行 Provider 显式声明的非只读操作，其余写入继续拒绝。"""
+        provider = self._providers.get(provider_key)
+        if provider is None:
+            raise ToolPolicyDenied("provider_not_registered")
+        operation = provider.get_operation(operation_key)
+        if operation.read_only:
+            raise ToolPolicyDenied("read_only_operation_expected")
+        if not provider.allows_registered_writes:
             raise ToolPolicyDenied("write_operation_denied")
         return AuthorizedOperation(provider=provider, operation=operation)

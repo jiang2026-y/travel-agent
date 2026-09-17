@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "企业级智能旅行助手的受限远程工具网关"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "alibabacloud-bailian20231229>=2.14.3,<3",
   "fastapi>=0.135,<0.140",
   "httpx>=0.28,<0.29",
   "travel-agent-sensitive-masker",

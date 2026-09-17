@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from travel_agent_agent.core.json_utils import parse_model_json
 from travel_agent_agent.intent.l1_rules import IntentRuleMatcher
 from travel_agent_agent.intent.l2_vector import (
     InMemoryIntentKnowledge,
@@ -15,7 +16,6 @@ from travel_agent_agent.intent.l2_vector import (
 )
 from travel_agent_agent.intent.recognizer import IntentRecognizer
 from travel_agent_agent.intent.result import IntentSource
-from travel_agent_agent.core.json_utils import parse_model_json
 from travel_agent_agent.intent.runtime import create_intent_runtime
 
 
@@ -296,7 +296,7 @@ def test_l3_fenced_json_is_recognized_as_multi_intent() -> None:
             },
             {
                 "intent": "hotel_search",
-                "target_agent": "itineraryPlanAgent",
+                "target_agent": "bookingAgent",
                 "confidence": "high",
                 "reason": "需要查询酒店。",
             },

@@ -1,4 +1,4 @@
-# 本文件实现行程管理 Agent 的动态中国时间注入中间件。
+# 本文件实现行程管理与预订 Agent 共用的动态中国时间注入中间件。
 # 定义 DynamicTimeInjectionHook，在每次模型调用前注入第二条 SYSTEM 时间消息。
 from __future__ import annotations
 

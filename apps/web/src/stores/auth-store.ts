@@ -20,7 +20,14 @@ export const useAuthStore = create<AuthState & AuthActions>((set) => ({
   initialize: async () => {
     set({ loading: true, error: null });
     try {
-      const user = await authApi.getCurrentUser();
+      let user = await authApi.getCurrentUser();
+      if (!user && import.meta.env.DEV) {
+        const account = import.meta.env.VITE_DEV_ADMIN_ACCOUNT;
+        const password = import.meta.env.VITE_DEV_ADMIN_PASSWORD;
+        if (account && password) {
+          user = await authApi.login({ account, password });
+        }
+      }
       set({ user, initialized: true, loading: false });
     } catch {
       set({ user: null, initialized: true, loading: false, error: "会话状态读取失败，请刷新后重试" });

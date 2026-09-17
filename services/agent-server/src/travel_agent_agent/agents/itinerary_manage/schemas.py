@@ -88,7 +88,8 @@ class TravelOrderInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    order_id: str = Field(min_length=1, max_length=64)
+    # 提交差旅申请时可由服务端生成单号，因此允许省略；修改走独立工具参数。
+    order_id: str | None = Field(default=None, max_length=64)
     destination: str | None = Field(default=None, max_length=256)
     departure_city: str | None = Field(default=None, max_length=128)
     departure_date: date | str | None = None
@@ -118,6 +119,7 @@ class ConflictDetailRecord(BaseModel):
     description: str
     suggestion: str
     order_id: str | None = None
+    order_summary: str | None = None
 
 
 class TravelOrderConflictRecord(BaseModel):

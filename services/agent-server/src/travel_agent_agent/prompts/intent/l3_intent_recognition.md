@@ -30,7 +30,7 @@
 字段说明：
 
 - `intents`：识别出的意图列表。单意图时只有一项，`multi_intent` 为 `false`。
-- `target_agent`：必须是**目标子智能体在 Spring 容器中的 bean 名（camelCase）**，如 `itineraryManageAgent`、`itineraryPlanAgent`、`reimbursementAgent`、`infoAgent`、`masterAgent`。不要输出 PascalCase 的人类可读名。系统会直接通过 `context.getBean(target_agent, ReActAgent.class)` 查找并调用，命名必须严格匹配。
+- `target_agent`：必须是**目标子智能体在 Spring 容器中的 bean 名（camelCase）**，如 `itineraryManageAgent`、`itineraryPlanAgent`、`bookingAgent`、`infoAgent`、`masterAgent`。不要输出 PascalCase 的人类可读名。系统会直接通过 `context.getBean(target_agent, ReActAgent.class)` 查找并调用，命名必须严格匹配。
 - `primary_intent`：当前最核心或最紧迫的意图。
 - `multi_intent`：是否包含多个意图。
 - `overall_reason`：整体判断理由，多意图时必须说明各意图之间的关系。
@@ -47,11 +47,11 @@
 | `approval_query` | 用户查询审批进度、审批状态、审批结果       | `itineraryManageAgent` | "审批到哪了""查一下审批""我的审批通过了没" |
 | `travel_order_query` | 用户查询已有差旅单详情/状态           | `itineraryManageAgent` | "我的差旅行程""出差单状态""查一下订单" |
 | `itinerary_planning` | 用户要求规划行程、做方案             | `itineraryPlanAgent` | "帮我规划行程""安排一下杭州行程" |
-| `flight_search` | 用户要查航班                   | `itineraryPlanAgent` | "查机票""北京到杭州航班" |
-| `train_search` | 用户要查火车                   | `itineraryPlanAgent` | "查火车票""高铁""动车" |
-| `hotel_search` | 用户要查酒店                   | `itineraryPlanAgent` | "查酒店""住哪里""附近酒店" |
+| `flight_search` | 用户要查航班                   | `bookingAgent` | "查机票""北京到杭州航班" |
+| `train_search` | 用户要查火车                   | `bookingAgent` | "查火车票""高铁""动车" |
+| `hotel_search` | 用户要查酒店                   | `bookingAgent` | "查酒店""住哪里""附近酒店" |
 | `booking` | 用户要预订/改签/取消已选方案          | `bookingAgent` | "订这个""帮我预定机票""改签""取消酒店" |
-| `reimbursement` | 用户要报销、识别发票、生成报销单         | `reimbursementAgent` | "报销""发票""帮我报一下" |
+| `reimbursement` | 用户要报销、识别发票、生成报销单         | `masterAgent` | "报销""发票""帮我报一下" |
 | `policy_query` | 用户查询差旅政策、餐标、酒店标准、签证/入境政策 | `infoAgent` | "差旅政策""餐标""签证""入境" |
 | `attractions_query` | 用户查询目的地景点、旅游信息           | `infoAgent` | "杭州有什么好玩的""景点推荐" |
 | `general_info` | 天气、地图、交通、目的地新闻等通用信息查询    | `infoAgent` | "天气怎么样""怎么去机场" |
@@ -126,9 +126,9 @@ Output:
     },
     {
       "intent": "hotel_search",
-      "target_agent": "itineraryPlanAgent",
+      "target_agent": "bookingAgent",
       "confidence": "high",
-      "reason": "用户同时要求查询杭州酒店，属于行程规划后续动作。"
+      "reason": "用户同时要求查询杭州酒店，属于住宿查询诉求。"
     }
   ],
   "primary_intent": "itinerary_planning",
@@ -136,4 +136,3 @@ Output:
   "overall_reason": "用户一句话包含行程规划和酒店查询两个意图，二者有先后依赖关系，先规划再查酒店。"
 }
 ```
-

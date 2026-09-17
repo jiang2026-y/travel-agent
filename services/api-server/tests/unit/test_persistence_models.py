@@ -17,6 +17,7 @@ def test_p0_table_registry() -> None:
         "travel_order",
         "approval_record",
         "booking_record",
+        "user_api_key",
     }
     assert set(model_registry()) == {
         "User",
@@ -29,6 +30,7 @@ def test_p0_table_registry() -> None:
         "TravelOrder",
         "ApprovalRecord",
         "BookingRecord",
+        "UserApiKey",
     }
 
 

@@ -3,7 +3,6 @@
 import pytest
 
 from travel_agent_agent.agents.base import AgentContext
-from travel_agent_agent.intent.result import IntentRecognitionResult
 from travel_agent_agent.agents.master.agent import serialize_intent_result
 from travel_agent_agent.agents.master.provider import (
     SubAgentConfig,
@@ -11,6 +10,7 @@ from travel_agent_agent.agents.master.provider import (
     SubAgentRequest,
     SubAgentResult,
 )
+from travel_agent_agent.intent.result import IntentRecognitionResult
 
 
 def _intent_result() -> IntentRecognitionResult:

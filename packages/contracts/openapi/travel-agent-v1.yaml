@@ -7,6 +7,13 @@ info:
 servers:
   - url: http://localhost:8000
 paths:
+  /api/v1/agent-capabilities:
+    get:
+      operationId: listAgentCapabilities
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/auth/login:
     post:
       operationId: login
@@ -28,6 +35,13 @@ paths:
         '204': { description: 会话已失效 }
         '401': { $ref: '#/components/responses/Error' }
       x-csrf-required: true
+  /api/v1/auth/me:
+    get:
+      operationId: getCurrentUser
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/conversations:
     get:
       operationId: listConversations
@@ -47,6 +61,128 @@ paths:
         '202': { $ref: '#/components/responses/Accepted' }
         '401': { $ref: '#/components/responses/Error' }
       x-csrf-required: true
+  /api/v1/conversations/{conversation_id}:
+    delete:
+      operationId: deleteConversation
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '404': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
+  /api/v1/conversations/{conversation_id}/title:
+    put:
+      operationId: renameConversation
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameConversationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '404': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
+  /api/v1/admin/approvals:
+    get:
+      operationId: listApprovals
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, maxLength: 32 }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/v1/conversations/{conversation_id}/messages/{message_id}/feedback:
+    put:
+      operationId: setMessageFeedback
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessageFeedbackRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '404': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
+  /api/v1/preferences/options:
+    get:
+      operationId: listPreferenceOptions
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+  /api/v1/preferences:
+    get:
+      operationId: getPreferences
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+    post:
+      operationId: savePreferences
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreferenceSaveRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '422': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
+  /api/v1/admin/approvals/{process_instance_id}/decision:
+    post:
+      operationId: decideApproval
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: process_instance_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/Identifier' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '409': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
+  /api/v1/admin/debug/agents:
+    get:
+      operationId: listDebugAgents
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/debug/agents/{agent_name}:
+    post:
+      operationId: debugAgent
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: agent_name
+          in: path
+          required: true
+          schema: { type: string, maxLength: 64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DebugAgentRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '409': { $ref: '#/components/responses/Error' }
+      x-csrf-required: true
   /api/v1/runs/{run_id}:
     get:
       operationId: getRun
@@ -54,7 +190,11 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RunId'
       responses:
-        '200': { $ref: '#/components/responses/Accepted' }
+        '200':
+          description: Run 状态及安全诊断快照
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunSummary' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/runs/{run_id}/resume:
     post:
@@ -66,7 +206,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/TaskRequest' }
+            schema: { $ref: '#/components/schemas/ResumeRequest' }
       responses:
         '202': { $ref: '#/components/responses/Accepted' }
         '409': { $ref: '#/components/responses/Error' }
@@ -99,6 +239,48 @@ paths:
             text/event-stream:
               schema: { type: string }
         '404': { $ref: '#/components/responses/Error' }
+  /api/v1/conversations/{conversation_id}/messages:
+    get:
+      operationId: listConversationMessages
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/travel-orders:
+    get:
+      operationId: listTravelOrders
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/bookings:
+    get:
+      operationId: listBookings
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/status:
+    get:
+      operationId: getAdminStatus
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/audit:
+    get:
+      operationId: listAdminAudit
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Accepted' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     cookieAuth:
@@ -112,6 +294,11 @@ components:
       in: path
       required: true
       schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 64 }
   schemas:
     CredentialLoginRequest:
       type: object
@@ -126,6 +313,50 @@ components:
       required: [message]
       properties:
         message: { type: string, minLength: 1, maxLength: 8000 }
+        # 带 conversation_id 时在同一会话内开启新一轮，复用该会话的 thread_id 以保留上下文。
+        conversation_id: { type: string, minLength: 1, maxLength: 64 }
+    RenameConversationRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 64 }
+    ApprovalDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [approve, reject] }
+        remark: { type: string, maxLength: 512 }
+    DebugAgentRequest:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        message: { type: string, minLength: 1, maxLength: 8000 }
+    MessageFeedbackRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        feedback: { type: [string, "null"], enum: [up, down, null] }
+    PreferenceSaveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        preferences:
+          type: object
+          additionalProperties: { type: array, maxItems: 32, items: { type: string, maxLength: 64 } }
+    ResumeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [message, decision, quick_action], default: message }
+        message: { type: string, maxLength: 8000 }
+        interaction_id: { type: string, maxLength: 128 }
+        decision: { type: string, enum: [approve, reject, edit, respond] }
+        confirmation_token: { type: string, maxLength: 512, writeOnly: true }
+        edited_args: { type: object }
+        quick_action: { type: string, maxLength: 32 }
     ErrorEnvelope:
       type: object
       additionalProperties: false
@@ -144,6 +375,28 @@ components:
     AcceptedResult:
       type: object
       additionalProperties: true
+    RunSummary:
+      type: object
+      additionalProperties: true
+      required: [status, conversation_id, run_id, thread_id, diagnostics]
+      properties:
+        status: { type: string }
+        conversation_id: { type: string }
+        run_id: { type: string }
+        thread_id: { type: string }
+        pending_interaction: { type: object, nullable: true }
+        assistant_reply: { type: string, nullable: true }
+        diagnostics: { $ref: '#/components/schemas/RunDiagnostics' }
+    RunDiagnostics:
+      type: object
+      additionalProperties: true
+      properties:
+        stages: { type: array, items: { type: object } }
+        route: { type: object }
+        master: { type: object }
+        sub_agents: { type: array, items: { type: object } }
+        recommendation: { type: object }
+        knowledge_search: { type: object }
   responses:
     Accepted:
       description: 请求已受理或资源查询成功

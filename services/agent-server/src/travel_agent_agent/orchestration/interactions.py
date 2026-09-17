@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
@@ -42,6 +42,8 @@ class PendingInteraction:
     token_hash: str | None
     action_version: int
     created_at: str
+    # 最近一次轮换前的令牌哈希：前端轮询会刷新令牌，宽限一版避免点击时令牌刚好过期。
+    previous_token_hash: str | None = None
 
     def public_payload(self, confirmation_token: str | None = None) -> dict[str, Any]:
         """返回可安全交给 API 与前端的摘要，Token 仅在当前响应中附带。"""
@@ -75,6 +77,7 @@ class PendingInteraction:
                 "allowed_decisions": list(self.allowed_decisions),
                 "summary": self.summary,
                 "token_hash": self.token_hash,
+                "previous_token_hash": self.previous_token_hash,
                 "action_version": self.action_version,
                 "created_at": self.created_at,
             },
@@ -89,9 +92,15 @@ class PendingInteraction:
             payload = json.loads(raw)
             return cls(
                 interaction_id=_required_string(payload, "interaction_id"),
-                kind=_required_literal(payload, "kind", {"clarification", "approval"}),
-                status=_required_literal(
-                    payload, "status", {"issued", "consumed", "rejected", "cancelled"}
+                kind=cast(
+                    InteractionKind,
+                    _required_literal(payload, "kind", {"clarification", "approval"}),
+                ),
+                status=cast(
+                    InteractionStatus,
+                    _required_literal(
+                        payload, "status", {"issued", "consumed", "rejected", "cancelled"}
+                    ),
                 ),
                 user_id=_required_string(payload, "user_id"),
                 conversation_id=_required_string(payload, "conversation_id"),
@@ -103,6 +112,7 @@ class PendingInteraction:
                 allowed_decisions=tuple(_required_strings(payload, "allowed_decisions")),
                 summary=_required_dict(payload, "summary"),
                 token_hash=_optional_string(payload, "token_hash"),
+                previous_token_hash=_optional_string(payload, "previous_token_hash"),
                 action_version=_required_positive_int(payload, "action_version"),
                 created_at=_required_string(payload, "created_at"),
             )
@@ -154,6 +164,26 @@ class PendingInteractionStore(Protocol):
         run_id: str,
         thread_id: str,
     ) -> PendingInteraction: ...
+
+    async def consume_answered(
+        self,
+        interaction_id: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        thread_id: str,
+    ) -> PendingInteraction: ...
+
+    async def hide_from_display(
+        self,
+        interaction_id: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        thread_id: str,
+    ) -> None: ...
 
     async def cancel_run(
         self, user_id: str, conversation_id: str, run_id: str, thread_id: str
@@ -213,9 +243,13 @@ class RedisPendingInteractionStore:
                     updated = replace(
                         interaction,
                         token_hash=_token_hash(token) if token else interaction.token_hash,
+                        previous_token_hash=(
+                            interaction.token_hash if token else interaction.previous_token_hash
+                        ),
                         action_version=interaction.action_version + (1 if token else 0),
                     )
-                    pipeline.multi()
+                    # redis-py 未给 Pipeline.multi 提供类型标注，这里仅为第三方存根缺口。
+                    pipeline.multi()  # type: ignore[no-untyped-call]
                     pipeline.set(key, updated.to_json(), ex=self.ttl_seconds)
                     pipeline.set(
                         _run_index_key(run_id), interaction.interaction_id, ex=self.ttl_seconds
@@ -259,9 +293,15 @@ class RedisPendingInteractionStore:
                     if not token or not secrets.compare_digest(
                         interaction.token_hash or "", _token_hash(token)
                     ):
-                        raise InteractionError("confirmation_token_invalid")
-                    updated = replace(interaction, status="consumed", token_hash=None)
-                    pipeline.multi()
+                        if not _token_matches(interaction, token):
+                            raise InteractionError("confirmation_token_invalid")
+                    updated = replace(
+                        interaction,
+                        status="consumed",
+                        token_hash=None,
+                        previous_token_hash=None,
+                    )
+                    pipeline.multi()  # type: ignore[no-untyped-call]
                     pipeline.set(key, updated.to_json(), ex=self.ttl_seconds)
                     pipeline.delete(_run_index_key(run_id))
                     await pipeline.execute()
@@ -289,10 +329,7 @@ class RedisPendingInteractionStore:
         _require_identity(interaction, user_id, conversation_id, run_id, thread_id)
         if interaction.status != "issued" or decision not in interaction.allowed_decisions:
             raise InteractionError("interaction_decision_not_allowed")
-        if interaction.kind == "approval" and (
-            not token
-            or not secrets.compare_digest(interaction.token_hash or "", _token_hash(token))
-        ):
+        if interaction.kind == "approval" and not _token_matches(interaction, token):
             raise InteractionError("confirmation_token_invalid")
         return interaction
 
@@ -312,12 +349,63 @@ class RedisPendingInteractionStore:
             raise InteractionError("interaction_not_found_or_expired")
         interaction = PendingInteraction.from_json(str(raw))
         _require_identity(interaction, user_id, conversation_id, run_id, thread_id)
-        updated = replace(interaction, status="rejected", token_hash=None)
+        updated = replace(interaction, status="rejected", token_hash=None, previous_token_hash=None)
         async with self.client.pipeline(transaction=True) as pipeline:
             pipeline.set(key, updated.to_json(), ex=self.ttl_seconds)
             pipeline.delete(_run_index_key(run_id))
             await pipeline.execute()
         return updated
+
+    async def consume_answered(
+        self,
+        interaction_id: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        thread_id: str,
+    ) -> PendingInteraction:
+        """标记澄清交互已被用户回答，并从 Run 当前索引移除，避免卡片残留。"""
+        key = _interaction_key(run_id, interaction_id)
+        raw = await self.client.get(key)
+        if not raw:
+            raise InteractionError("interaction_not_found_or_expired")
+        interaction = PendingInteraction.from_json(str(raw))
+        _require_identity(interaction, user_id, conversation_id, run_id, thread_id)
+        updated = replace(interaction, status="consumed", token_hash=None, previous_token_hash=None)
+        async with self.client.pipeline(transaction=True) as pipeline:
+            pipeline.set(key, updated.to_json(), ex=self.ttl_seconds)
+            pipeline.delete(_run_index_key(run_id))
+            await pipeline.execute()
+        return updated
+
+    async def hide_from_display(
+        self,
+        interaction_id: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        thread_id: str,
+    ) -> None:
+        """用户已提交决定后仅摘除 Run 当前索引，保留记录供写事务原子消费。
+
+        审批决定提交后，图恢复执行仍需模型多轮推理才会真正调用写工具并消费
+        Token；若期间仍向查询接口暴露同一交互，前端轮询会反复弹出同一张确认
+        卡片，并与已经到达的助手回复冲突。这里只删除索引，交互记录与 Token
+        哈希保持不变，因此后续 consume 仍能正常校验并消费。
+        """
+        key = _interaction_key(run_id, interaction_id)
+        raw = await self.client.get(key)
+        if not raw:
+            return
+        interaction = PendingInteraction.from_json(str(raw))
+        _require_identity(interaction, user_id, conversation_id, run_id, thread_id)
+        current = await self.client.get(_run_index_key(run_id))
+        if current is not None and str(current) != interaction_id:
+            # 已被更新的一轮交互占用索引时不越权摘除。
+            return
+        await self.client.delete(_run_index_key(run_id))
 
     async def cancel_run(
         self, user_id: str, conversation_id: str, run_id: str, thread_id: str
@@ -339,6 +427,8 @@ class InMemoryPendingInteractionStore:
     """提供不访问 Redis 的单元测试替身，并保持 Token 消费语义一致。"""
 
     records: dict[str, PendingInteraction]
+    # 已被用户提交决定的交互不再展示，但仍可被 consume 消费。
+    hidden: set[str] = field(default_factory=set)
 
     async def issue(self, interaction: PendingInteraction) -> tuple[PendingInteraction, str]:
         """签发测试用 Token 并保存哈希化记录。"""
@@ -349,9 +439,11 @@ class InMemoryPendingInteractionStore:
             interaction,
             status="issued",
             token_hash=_token_hash(token) if token else None,
+            previous_token_hash=None,
             created_at=datetime.now(UTC).isoformat(),
         )
         self.records[stored.interaction_id] = stored
+        self.hidden.discard(stored.interaction_id)
         return stored, token
 
     async def get_for_display(
@@ -362,7 +454,9 @@ class InMemoryPendingInteractionStore:
             (
                 item
                 for item in self.records.values()
-                if item.run_id == run_id and item.status == "issued"
+                if item.run_id == run_id
+                and item.status == "issued"
+                and item.interaction_id not in self.hidden
             ),
             None,
         )
@@ -373,6 +467,9 @@ class InMemoryPendingInteractionStore:
         updated = replace(
             interaction,
             token_hash=_token_hash(token) if token else interaction.token_hash,
+            previous_token_hash=(
+                interaction.token_hash if token else interaction.previous_token_hash
+            ),
             action_version=interaction.action_version + (1 if token else 0),
         )
         self.records[updated.interaction_id] = updated
@@ -397,8 +494,9 @@ class InMemoryPendingInteractionStore:
         ):
             raise InteractionError("interaction_action_mismatch")
         if not secrets.compare_digest(interaction.token_hash or "", _token_hash(token)):
-            raise InteractionError("confirmation_token_invalid")
-        updated = replace(interaction, status="consumed", token_hash=None)
+            if not _token_matches(interaction, token):
+                raise InteractionError("confirmation_token_invalid")
+        updated = replace(interaction, status="consumed", token_hash=None, previous_token_hash=None)
         self.records[interaction_id] = updated
         return updated
 
@@ -425,7 +523,8 @@ class InMemoryPendingInteractionStore:
             not token
             or not secrets.compare_digest(interaction.token_hash or "", _token_hash(token))
         ):
-            raise InteractionError("confirmation_token_invalid")
+            if not _token_matches(interaction, token):
+                raise InteractionError("confirmation_token_invalid")
         return interaction
 
     async def reject(self, interaction_id: str, **context: str) -> PendingInteraction:
@@ -437,9 +536,40 @@ class InMemoryPendingInteractionStore:
             interaction,
             context["user_id"], context["conversation_id"], context["run_id"], context["thread_id"],
         )
-        updated = replace(interaction, status="rejected", token_hash=None)
+        updated = replace(interaction, status="rejected", token_hash=None, previous_token_hash=None)
         self.records[interaction_id] = updated
         return updated
+
+    async def consume_answered(self, interaction_id: str, **context: str) -> PendingInteraction:
+        """标记测试交互已被回答。"""
+        interaction = self.records.get(interaction_id)
+        if interaction is None:
+            raise InteractionError("interaction_not_found_or_expired")
+        _require_identity(
+            interaction,
+            context["user_id"],
+            context["conversation_id"],
+            context["run_id"],
+            context["thread_id"],
+        )
+        updated = replace(interaction, status="consumed", token_hash=None, previous_token_hash=None)
+        self.records[interaction_id] = updated
+        self.hidden.discard(interaction_id)
+        return updated
+
+    async def hide_from_display(self, interaction_id: str, **context: str) -> None:
+        """测试替身中把交互从展示集合摘除，但不影响后续 Token 消费。"""
+        interaction = self.records.get(interaction_id)
+        if interaction is None:
+            return
+        _require_identity(
+            interaction,
+            context["user_id"],
+            context["conversation_id"],
+            context["run_id"],
+            context["thread_id"],
+        )
+        self.hidden.add(interaction_id)
 
     async def cancel_run(
         self, user_id: str, conversation_id: str, run_id: str, thread_id: str
@@ -449,6 +579,7 @@ class InMemoryPendingInteractionStore:
             if interaction.run_id != run_id:
                 continue
             _require_identity(interaction, user_id, conversation_id, run_id, thread_id)
+            self.hidden.discard(interaction_id)
             del self.records[interaction_id]
 
 
@@ -476,6 +607,16 @@ def _new_token() -> str:
 def _token_hash(token: str) -> str:
     """计算 Token 的不可逆 SHA-256 哈希以便 Redis 校验。"""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _token_matches(interaction: PendingInteraction, token: str | None) -> bool:
+    """接受当前令牌或最近一次轮换前的令牌，避免前端轮询造成的点击竞态。"""
+    if not token:
+        return False
+    digest = _token_hash(token)
+    return secrets.compare_digest(
+        interaction.token_hash or "", digest
+    ) or secrets.compare_digest(interaction.previous_token_hash or "", digest)
 
 
 def _require_identity(

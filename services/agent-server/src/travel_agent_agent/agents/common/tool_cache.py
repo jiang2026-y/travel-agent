@@ -70,16 +70,16 @@ class SessionToolCache:
     ) -> tuple[ResultT | None, bool]:
         """在单把锁内执行政策 cache-aside，避免同城并发调用重复回源。"""
         if not city:
-            result = await loader()
-            return result[1], False
+            _, loaded = await loader()
+            return loaded, False
         async with self._lock:
             cached = self.travel_policy_by_city.get(city)
             if cached is not None:
                 return cached, True  # type: ignore[return-value]
-            serialized, result = await loader()
+            serialized, loaded = await loader()
             if serialized and serialized.strip():
                 self.travel_policy_by_city[city] = serialized
-            return result, False
+            return loaded, False
 
     async def load_user_contact_info(
         self, loader: Callable[[], Awaitable[dict[str, Any]]]

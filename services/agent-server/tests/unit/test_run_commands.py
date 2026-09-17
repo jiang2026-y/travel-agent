@@ -1,7 +1,15 @@
 # 本文件验证 Agent Server 的 Run 启动、恢复与取消内部命令。
-# 定义测试客户端、命令载荷和四个测试函数，分别覆盖幂等启动、恢复、取消及检查点过期处理。
+# 定义测试客户端、命令载荷与用例，覆盖幂等启动、恢复、取消、检查点过期、
+# 直达子 Agent 的正常完成状态迁移以及上游额度错误的归一化。
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
 from fastapi.testclient import TestClient
 
+from travel_agent_agent.agents.master.agent import MasterAgent
+from travel_agent_agent.api.internal_commands import _normalize_execution_error
 from travel_agent_agent.core.settings import Settings
 from travel_agent_agent.main import create_app
 from travel_agent_agent.orchestration.checkpoints import InMemoryRunCheckpointStore
@@ -55,7 +63,7 @@ def _headers(token: str) -> dict[str, str]:
 
 
 def test_start_run_is_idempotent(tmp_path) -> None:
-    """相同身份、会话和线程重复提交 start 时应返回原检查点而不覆盖版本。"""
+    """航班查询直达预订智能体且幂等：相同身份、会话和线程重复提交返回原检查点。"""
     client, token = _create_client(tmp_path)
 
     first = client.post(
@@ -67,9 +75,10 @@ def test_start_run_is_idempotent(tmp_path) -> None:
 
     assert first.status_code == 200
     assert first.json()["status"] == "running"
+    # 直达路由不改变状态（RUNNING → RUNNING 为无操作），因此版本停在 start 后的 2。
     assert first.json()["version"] == 2
     assert first.json()["routing_action"] == "direct_dispatch"
-    assert first.json()["target_agent"] == "itineraryPlanAgent"
+    assert first.json()["target_agent"] == "bookingAgent"
     assert first.json()["intent_code"] == "flight_search"
     assert first.json()["intent_source"] == "RULE"
     assert second.json() == first.json()
@@ -136,3 +145,76 @@ def test_multi_intent_is_kept_by_master_for_clarification(tmp_path) -> None:
     assert response.json()["routing_action"] == "clarify"
     assert response.json()["target_agent"] == "masterAgent"
     assert response.json()["intent_code"] == "unknown"
+
+
+def test_openai_compatible_quota_error_is_normalized() -> None:
+    """OpenAI 兼容 SDK 包装后的上游额度错误仍应被归一化为稳定诊断码。"""
+    error = RuntimeError("provider request failed")
+    error.body = {"error": {"code": "insufficient_quota"}}  # type: ignore[attr-defined]
+
+    code, retryable = _normalize_execution_error(error, "master_agent_execution_failed")
+
+    assert code == "dashscope_quota_exhausted"
+    assert retryable is False
+
+
+def _provider_client(tmp_path) -> tuple[TestClient, Any, str]:
+    """构造已审批 Provider 的测试客户端，并注入可替换的 Master 替身。"""
+    token = "b" * 32
+    token_file = tmp_path / "api_agent_internal_token"
+    token_file.write_text(token, encoding="utf-8")
+    (tmp_path / "agent_gateway_internal_token").write_text("g" * 48, encoding="utf-8")
+    settings = Settings.from_environment(
+        {
+            "TRAVEL_AGENT_ENV": "development",
+            "TRAVEL_AGENT_EXTERNAL_MODE": "real_readonly",
+            "API_AGENT_INTERNAL_TOKEN_FILE": str(token_file),
+            "AGENT_GATEWAY_INTERNAL_TOKEN_FILE": str(
+                tmp_path / "agent_gateway_internal_token"
+            ),
+            "TRAVEL_AGENT_PROVIDER_KEY": "dashscope",
+            "TRAVEL_AGENT_PROVIDER_VERSION": "intent-v1",
+            "TRAVEL_AGENT_PROVIDER_BASE_URL": (
+                "https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+            ),
+            "TRAVEL_AGENT_PROVIDER_SECRET_REF": "dashscope_api_key",
+            "TRAVEL_AGENT_PROVIDER_APPROVED": "true",
+            "TUNIU_API_KEY_FILE": str(tmp_path / "tuniu_api_key"),
+        }
+    )
+    application = create_app(settings, InMemoryRunCheckpointStore({}))
+    master = MasterAgent.create_with_default_provider(object(), settings=settings)
+
+    async def astream(
+        message: str,
+        rewritten_question: str,
+        intent_result_json: str,
+        session_id: str | None = None,
+        context: object | None = None,
+    ) -> Any:
+        """用固定分片与最终状态替代真实流式模型调用，避免访问外部网络。"""
+        del message, rewritten_question, intent_result_json, session_id, context
+        yield ("delta", "已为您查询到该差旅单的")
+        yield (
+            "final",
+            {"messages": [SimpleNamespace(content="已为您查询到该差旅单的审批状态。")]},
+        )
+
+    master.astream = astream  # type: ignore[method-assign]
+    application.state.master_agent = master
+    return TestClient(application), settings, token
+
+
+def test_direct_dispatch_without_interrupt_completes_run(tmp_path) -> None:
+    """直达子 Agent 且无待交互时，Run 必须落到 completed 并返回助手回复。"""
+    client, _, token = _provider_client(tmp_path)
+
+    response = client.post(
+        "/internal/v1/commands/runs/start",
+        headers=_headers(token),
+        json=_payload("start", task_brief="帮我预订酒店"),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert response.json()["assistant_reply"] == "已为您查询到该差旅单的审批状态。"

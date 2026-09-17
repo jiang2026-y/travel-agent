@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Generic, TypeVar
-
-InputT = TypeVar("InputT")
-OutputT = TypeVar("OutputT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,9 +19,10 @@ class AgentContext:
     user_id: str = ""
     role: str = "user"
     context_summary: str = ""
+    diagnostic_callback: Callable[[str, dict[str, object]], Awaitable[None]] | None = None
 
 
-class AgentBase(ABC, Generic[InputT, OutputT]):
+class AgentBase[InputT, OutputT](ABC):
     """统一非 ReAct Agent 的元数据和异步执行入口。"""
 
     name: str = "agent"

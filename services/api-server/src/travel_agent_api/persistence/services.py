@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from travel_agent_sensitive_masker import SensitiveMasker
 
@@ -16,7 +16,14 @@ from travel_agent_api.application.audit_service import AuditEntry
 from travel_agent_api.core.correlation import CorrelationContext
 from travel_agent_api.core.encryption import DataEncryptionService, EncryptedPayload
 from travel_agent_api.persistence.database import metadata
-from travel_agent_api.persistence.models import AuditEvent, Conversation, Message, Run, User
+from travel_agent_api.persistence.models import (
+    AuditEvent,
+    Conversation,
+    Message,
+    Run,
+    User,
+    UserApiKey,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +125,16 @@ def _credential_user(user: User | None) -> CredentialUser | None:
     )
 
 
+async def _touch_conversation(session: AsyncSession, conversation_id: str) -> None:
+    """刷新会话的更新时间，使会话列表按最近活动正确排序。"""
+    conversations = metadata.tables["conversations"].c
+    await session.execute(
+        update(Conversation)
+        .where(conversations.conversation_id == conversation_id)
+        .values(updated_at=datetime.now(UTC))
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationSummary:
     """表示会话列表可返回的非敏感摘要。"""
@@ -137,6 +154,18 @@ class RunSummary:
     status: str
 
 
+@dataclass(frozen=True, slots=True)
+class MessageSummary:
+    """表示可安全返回前端的已脱敏会话消息。"""
+
+    message_id: str
+    run_id: str | None
+    role: str
+    content: str
+    created_at: datetime
+    feedback: str | None = None
+
+
 @dataclass(slots=True)
 class PostgresConversationService:
     """原子创建会话、加密消息和 Run，并提供按所有者隔离的查询。"""
@@ -150,7 +179,7 @@ class PostgresConversationService:
         """提取当前会话最近十条历史消息并脱敏，截断至 2000 字符后供 Agent 使用。"""
         conversations = metadata.tables["conversations"].c
         messages = metadata.tables["messages"].c
-        ownership = select(Conversation.conversation_id).where(
+        ownership = select(conversations.conversation_id).where(
             conversations.conversation_id == conversation_id,
             conversations.user_id == user_id,
             conversations.deleted_at.is_(None),
@@ -220,6 +249,63 @@ class PostgresConversationService:
             await session.commit()
         return RunSummary(run_id, conversation_id, thread_id, "queued")
 
+    async def start_turn(
+        self, user_id: str, conversation_id: str, message: str, correlation: CorrelationContext
+    ) -> RunSummary | None:
+        """在既有会话内开启新一轮：新建 Run 并复用该会话的 thread_id 以保留上下文。"""
+        conversations = metadata.tables["conversations"].c
+        runs = metadata.tables["runs"].c
+        run_id = f"run_{uuid.uuid4().hex}"
+        encrypted = self.encryption.encrypt_json({"content": message})
+        async with self.session_factory() as session:
+            conversation = await session.scalar(
+                select(Conversation).where(
+                    conversations.conversation_id == conversation_id,
+                    conversations.user_id == user_id,
+                    conversations.deleted_at.is_(None),
+                )
+            )
+            if conversation is None:
+                return None
+            # 复用该会话最近一次 Run 的 thread_id，使主智能体与子 Agent 的检查点延续。
+            previous_thread = await session.scalar(
+                select(runs.thread_id)
+                .where(runs.conversation_id == conversation_id)
+                .order_by(desc(runs.created_at))
+                .limit(1)
+            )
+            thread_id = (
+                previous_thread
+                if isinstance(previous_thread, str) and previous_thread
+                else f"thread_{uuid.uuid4().hex}"
+            )
+            session.add(
+                Run(
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    status="queued",
+                    trace_id=correlation.trace_id,
+                    request_id=correlation.request_id,
+                )
+            )
+            await session.flush()
+            session.add(
+                Message(
+                    message_id=f"msg_{uuid.uuid4().hex}",
+                    conversation_id=conversation_id,
+                    run_id=run_id,
+                    role="user",
+                    content_ciphertext=encrypted.ciphertext,
+                    content_nonce=encrypted.nonce,
+                    content_key_version=encrypted.key_version,
+                )
+            )
+            conversation.updated_at = datetime.now(UTC)
+            await session.commit()
+        return RunSummary(run_id, conversation_id, thread_id, "queued")
+
     async def list_conversations(self, user_id: str) -> tuple[ConversationSummary, ...]:
         """按最近活动时间读取当前用户未删除的会话摘要。"""
         conversations = metadata.tables["conversations"].c
@@ -267,8 +353,115 @@ class PostgresConversationService:
                     content_key_version=encrypted.key_version,
                 )
             )
+            # 追加消息即视为会话有新活动，刷新更新时间以保持会话列表排序正确。
+            await _touch_conversation(session, run.conversation_id)
             await session.commit()
         return RunSummary(run.run_id, run.conversation_id, run.thread_id, run.status)
+
+    async def append_assistant_message(
+        self, user_id: str, run_id: str, content: str
+    ) -> MessageSummary | None:
+        """加密保存 Agent 主回复，并验证 Run 所属用户。"""
+        runs = metadata.tables["runs"].c
+        statement = select(Run).where(runs.run_id == run_id, runs.user_id == user_id)
+        encrypted = self.encryption.encrypt_json({"content": content})
+        async with self.session_factory() as session:
+            run = await session.scalar(statement)
+            if run is None:
+                return None
+            item = Message(
+                message_id=f"msg_{uuid.uuid4().hex}",
+                conversation_id=run.conversation_id,
+                run_id=run.run_id,
+                role="assistant",
+                content_ciphertext=encrypted.ciphertext,
+                content_nonce=encrypted.nonce,
+                content_key_version=encrypted.key_version,
+            )
+            session.add(item)
+            await _touch_conversation(session, run.conversation_id)
+            await session.commit()
+        return MessageSummary(item.message_id, item.run_id, item.role, content, item.created_at)
+
+    async def list_messages(
+        self, user_id: str, conversation_id: str
+    ) -> tuple[MessageSummary, ...]:
+        """按会话归属读取并解密可见消息，返回脱敏后的文本。"""
+        conversations = metadata.tables["conversations"].c
+        messages = metadata.tables["messages"].c
+        ownership = select(conversations.conversation_id).where(
+            conversations.conversation_id == conversation_id,
+            conversations.user_id == user_id,
+            conversations.deleted_at.is_(None),
+        )
+        statement = (
+            select(Message)
+            .where(messages.conversation_id.in_(ownership))
+            .order_by(messages.created_at)
+        )
+        masker = SensitiveMasker()
+        summaries: list[MessageSummary] = []
+        async with self.session_factory() as session:
+            rows = (await session.scalars(statement)).all()
+        for row in rows:
+            if (
+                row.content_ciphertext is None
+                or row.content_nonce is None
+                or row.content_key_version is None
+            ):
+                continue
+            try:
+                content = self.encryption.decrypt_json(
+                    EncryptedPayload(
+                        row.content_ciphertext, row.content_nonce, row.content_key_version
+                    )
+                ).get("content")
+            except Exception:
+                continue
+            if isinstance(content, str) and content.strip():
+                summaries.append(
+                    MessageSummary(
+                        row.message_id,
+                        row.run_id,
+                        row.role,
+                        masker.mask_text(content.strip()),
+                        row.created_at or datetime.now(UTC),
+                        row.feedback,
+                    )
+                )
+        return tuple(summaries)
+
+    async def set_message_feedback(
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        feedback: str | None,
+    ) -> str | None:
+        """写入或清除助手消息反馈；只允许 up/down/null，越权返回 None。"""
+        if feedback not in {None, "up", "down"}:
+            raise ValueError("message_feedback_invalid")
+        conversations = metadata.tables["conversations"].c
+        messages = metadata.tables["messages"].c
+        ownership = select(conversations.conversation_id).where(
+            conversations.conversation_id == conversation_id,
+            conversations.user_id == user_id,
+            conversations.deleted_at.is_(None),
+        )
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(Message).where(
+                    messages.message_id == message_id,
+                    messages.conversation_id.in_(ownership),
+                    messages.role == "assistant",
+                )
+            )
+            if not isinstance(row, Message):
+                return None
+            row.feedback = feedback
+            row.feedback_at = None if feedback is None else datetime.now(UTC)
+            await session.commit()
+        return feedback
 
     async def update_run_status(
         self, user_id: str, run_id: str, status: str
@@ -287,3 +480,163 @@ class PostgresConversationService:
                 run.ended_at = datetime.now(UTC)
             await session.commit()
         return RunSummary(run.run_id, run.conversation_id, run.thread_id, run.status)
+
+    async def update_title(
+        self, user_id: str, conversation_id: str, title: str
+    ) -> str | None:
+        """更新当前用户会话标题；标题未变化或会话不可见时返回 None。"""
+        conversations = metadata.tables["conversations"].c
+        statement = select(Conversation).where(
+            conversations.conversation_id == conversation_id,
+            conversations.user_id == user_id,
+            conversations.deleted_at.is_(None),
+        )
+        async with self.session_factory() as session:
+            conversation = await session.scalar(statement)
+            if conversation is None:
+                return None
+            normalized = title.strip()[:256]
+            if not normalized or conversation.title == normalized:
+                return None
+            conversation.title = normalized
+            await session.commit()
+        return normalized
+
+    async def rename_conversation(
+        self, user_id: str, conversation_id: str, title: str
+    ) -> str | None:
+        """按用户主动改名校验后写入标题；会话不可见时返回 None。"""
+        normalized = title.strip()
+        if not normalized or len(normalized) > 64:
+            raise ValueError("conversation_title_invalid")
+        conversations = metadata.tables["conversations"].c
+        statement = select(Conversation).where(
+            conversations.conversation_id == conversation_id,
+            conversations.user_id == user_id,
+            conversations.deleted_at.is_(None),
+        )
+        async with self.session_factory() as session:
+            conversation = await session.scalar(statement)
+            if conversation is None:
+                return None
+            conversation.title = normalized
+            conversation.updated_at = datetime.now(UTC)
+            await session.commit()
+        return normalized
+
+    async def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
+        """软删除当前用户会话；不可见或已删除时返回 False。"""
+        conversations = metadata.tables["conversations"].c
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(Conversation)
+                .where(
+                    conversations.conversation_id == conversation_id,
+                    conversations.user_id == user_id,
+                    conversations.deleted_at.is_(None),
+                )
+                .values(deleted_at=datetime.now(UTC), updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+        return bool(getattr(result, "rowcount", 0))
+
+    async def fail_stale_runs(
+        self, *, older_than_hours: int = 24
+    ) -> tuple[tuple[str, str, str], ...]:
+        """把长期未结束的运行标记为 failed，返回 (user_id, run_id, thread_id) 列表。"""
+        if older_than_hours <= 0:
+            raise ValueError("stale_run_hours_must_be_positive")
+        runs = metadata.tables["runs"].c
+        deadline = datetime.now(UTC) - timedelta(hours=older_than_hours)
+        statement = select(Run).where(
+            runs.status.in_(("created", "queued", "running")),
+            runs.created_at < deadline,
+        )
+        async with self.session_factory() as session:
+            rows = list((await session.scalars(statement)).all())
+            if not rows:
+                return ()
+            ended_at = datetime.now(UTC)
+            affected: list[tuple[str, str, str]] = []
+            for row in rows:
+                row.status = "failed"
+                row.ended_at = ended_at
+                affected.append((row.user_id, row.run_id, row.thread_id))
+            await session.commit()
+        return tuple(affected)
+
+
+@dataclass(slots=True)
+class PostgresUserApiKeyService:
+    """按用户与 provider 读写第三方 API Key 密文，永不回显明文。"""
+
+    session_factory: async_sessionmaker[AsyncSession]
+    encryption: DataEncryptionService
+
+    async def has_key(self, user_id: str, provider: str) -> bool:
+        """判断当前用户是否已配置指定 provider 的 API Key。"""
+        return await self._load(user_id, provider) is not None
+
+    async def reveal(self, user_id: str, provider: str) -> str | None:
+        """解密返回明文 API Key，仅供受保护内部接口在写操作前注入使用。"""
+        row = await self._load(user_id, provider)
+        if row is None:
+            return None
+        if (
+            row.api_key_ciphertext is None
+            or row.api_key_nonce is None
+            or row.api_key_key_version is None
+        ):
+            return None
+        try:
+            payload = self.encryption.decrypt_json(
+                EncryptedPayload(
+                    row.api_key_ciphertext, row.api_key_nonce, row.api_key_key_version
+                )
+            )
+        except Exception:
+            return None
+        api_key = payload.get("api_key")
+        return api_key if isinstance(api_key, str) and api_key else None
+
+    async def save(self, user_id: str, provider: str, api_key: str) -> None:
+        """以 AES-GCM 密文 upsert 用户 API Key，明文不落库、不写日志。"""
+        encrypted = self.encryption.encrypt_json({"api_key": api_key})
+        api_keys = metadata.tables["user_api_key"].c
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(UserApiKey).where(
+                    api_keys.user_id == user_id, api_keys.provider == provider
+                )
+            )
+            if row is None:
+                row = UserApiKey(user_id=user_id, provider=provider)
+            row.api_key_ciphertext = encrypted.ciphertext
+            row.api_key_nonce = encrypted.nonce
+            row.api_key_key_version = encrypted.key_version
+            session.add(row)
+            await session.commit()
+
+    async def delete(self, user_id: str, provider: str) -> None:
+        """删除当前用户的 API Key 记录，幂等且不抛错。"""
+        api_keys = metadata.tables["user_api_key"].c
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(UserApiKey).where(
+                    api_keys.user_id == user_id, api_keys.provider == provider
+                )
+            )
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+
+    async def _load(self, user_id: str, provider: str) -> UserApiKey | None:
+        """按业务键读取密文行，未配置时返回 None。"""
+        api_keys = metadata.tables["user_api_key"].c
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(UserApiKey).where(
+                    api_keys.user_id == user_id, api_keys.provider == provider
+                )
+            )
+        return row if isinstance(row, UserApiKey) else None

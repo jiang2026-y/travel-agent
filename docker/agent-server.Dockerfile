@@ -4,6 +4,14 @@ FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
 
 FROM python:3.12-slim
 
+# 安装途牛 CLI 运行时；API Key 仍只通过 Docker Secret 注入，不写入镜像。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && npm install --global tuniu-cli@1.1.4 \
+    && apt-get purge -y npm \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
 COPY --from=uv /uv /uvx /bin/
 WORKDIR /workspace
 

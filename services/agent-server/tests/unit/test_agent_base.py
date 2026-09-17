@@ -17,7 +17,7 @@ class FakeIntentClient:
         return json.dumps({
             "intents": [{
                 "intent": "flight_search",
-                "target_agent": "itineraryPlanAgent",
+                "target_agent": "bookingAgent",
                 "confidence": "high",
                 "reason": "用户查询航班信息。",
             }],
