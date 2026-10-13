@@ -1,8 +1,9 @@
-# 本文件定义差旅申请单和审批单的状态机及自动完成规则。
-# 定义 TravelOrderStatus、ApprovalRecordStatus、transition_travel_order 和 auto_complete_orders。
+# 本文件定义差旅申请单与审批单的状态机、冲突规则和差旅持久化事务服务。
+# 定义 TravelOrderStatus、ApprovalRecordStatus、transition_travel_order、should_auto_complete、
+# evaluate_travel_conflicts、SubmitOutcome 与 TravelOrderPersistenceService。
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -289,6 +290,24 @@ def _normalize_city_name(value: str) -> str:
     return name.casefold()
 
 
+def _duplicate_lookup_key(payload: Mapping[str, Any]) -> tuple[str, str, Any, Any, str] | None:
+    """返回要素级幂等使用的五个出行要素；任一要素缺失时返回 None 表示不做去重。"""
+    destination = payload.get("destination")
+    departure_city = payload.get("departure_city")
+    purpose = payload.get("purpose")
+    if not isinstance(destination, str) or not destination.strip():
+        return None
+    if not isinstance(departure_city, str) or not departure_city.strip():
+        return None
+    if not isinstance(purpose, str) or not purpose.strip():
+        return None
+    departure_date = payload.get("departure_date")
+    return_date = payload.get("return_date")
+    if departure_date is None or return_date is None:
+        return None
+    return (destination, departure_city, departure_date, return_date, purpose)
+
+
 class TravelOrderStatus(StrEnum):
     """差旅申请单生命周期状态。"""
 
@@ -337,6 +356,14 @@ def should_auto_complete(status: TravelOrderStatus, return_date: date | None, to
     return status is TravelOrderStatus.APPROVED and return_date is not None and return_date < today
 
 
+@dataclass(frozen=True, slots=True)
+class SubmitOutcome:
+    """表示一次差旅申请提交的结果：差旅单实体与是否命中要素级幂等。"""
+
+    order: TravelOrder
+    duplicate: bool = False
+
+
 class TravelOrderPersistenceService:
     """通过 SQLModel 事务读写差旅单、审批单和预订记录，保证双向关联与幂等。"""
 
@@ -351,15 +378,18 @@ class TravelOrderPersistenceService:
 
     async def submit(
         self, *, user_id: str, payload: dict[str, Any], idempotency_key: str
-    ) -> TravelOrder:
-        """原子创建差旅单和审批单，并以 order_id 作为幂等结果索引。"""
+    ) -> SubmitOutcome:
+        """原子创建差旅单和审批单；相同出行要素已存在时直接返回已有单。"""
         order_id = idempotency_key
         async with self.session_factory() as session:
             existing = await session.get(TravelOrder, order_id)
             if existing is not None:
                 if existing.user_id != user_id:
                     raise PermissionError("travel_order_forbidden")
-                return existing
+                return SubmitOutcome(existing, duplicate=True)
+            duplicate = await self._find_duplicate_active_order(session, user_id, payload)
+            if duplicate is not None:
+                return SubmitOutcome(duplicate, duplicate=True)
             now = datetime.now(UTC)
             approval_id = f"approval_{uuid4().hex}"
             order = TravelOrder(
@@ -391,11 +421,46 @@ class TravelOrderPersistenceService:
             session.add_all([order, approval])
             await session.commit()
             await session.refresh(order)
-            return order
+            return SubmitOutcome(order)
+
+    async def _find_duplicate_active_order(
+        self, session: AsyncSession, user_id: str, payload: Mapping[str, Any]
+    ) -> TravelOrder | None:
+        """按用户与五个出行要素查找生效中的同行程差旅单，用于提交去重。
+
+        与 Java 参考实现口径一致：要素为目的地、出发城市、出发日期、返回日期与事由，
+        状态只考虑 DRAFT/SUBMITTED/APPROVED；任一要素缺失时不做去重。
+        """
+        key = _duplicate_lookup_key(payload)
+        if key is None:
+            return None
+        destination, departure_city, departure_date, return_date, purpose = key
+        statement = (
+            select(TravelOrder)
+            .where(
+                _ORDER_COLUMNS.user_id == user_id,
+                _ORDER_COLUMNS.status.in_(
+                    [
+                        TravelOrderStatus.DRAFT,
+                        TravelOrderStatus.SUBMITTED,
+                        TravelOrderStatus.APPROVED,
+                    ]
+                ),
+                _ORDER_COLUMNS.destination == destination,
+                _ORDER_COLUMNS.departure_city == departure_city,
+                _ORDER_COLUMNS.departure_date == departure_date,
+                _ORDER_COLUMNS.return_date == return_date,
+                _ORDER_COLUMNS.purpose == purpose,
+            )
+            .order_by(_ORDER_COLUMNS.created_at.desc())
+            .limit(1)
+        )
+        row = await session.scalar(statement)
+        return row if isinstance(row, TravelOrder) else None
 
     async def create_and_submit(
         self, *, user_id: str, payload: dict[str, Any], order_id: str
-    ) -> TravelOrder:
+    ) -> SubmitOutcome:
         """以领域服务命名封装差旅单与审批单三步事务写入。"""
         return await self.submit(user_id=user_id, payload=payload, idempotency_key=order_id)
 

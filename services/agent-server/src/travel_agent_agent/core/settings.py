@@ -85,7 +85,6 @@ class Settings:
     hitl_token_ttl_seconds: int
     api_agent_token_file: str
     agent_gateway_token_file: str
-    data_encryption_key_file: str
     privacy_features_enabled: bool
     provider_registration: ProviderRegistration
     provider_approved: bool
@@ -148,9 +147,6 @@ class Settings:
             agent_gateway_token_file=values.get(
                 "AGENT_GATEWAY_INTERNAL_TOKEN_FILE",
                 "/run/secrets/agent_gateway_internal_token",
-            ),
-            data_encryption_key_file=values.get(
-                "TRAVEL_AGENT_DATA_ENCRYPTION_KEY_FILE", "/run/secrets/data_encryption_key"
             ),
             privacy_features_enabled=_read_bool(
                 values, "TRAVEL_AGENT_PRIVACY_FEATURES_ENABLED", default=True

@@ -29,10 +29,6 @@ from travel_agent_agent.infrastructure.dashscope_client import create_dashscope_
 from travel_agent_agent.infrastructure.destination_live_client import (
     create_destination_live_client,
 )
-from travel_agent_agent.infrastructure.itinerary_plan_store import (
-    InMemoryItineraryPlanStore,
-    ItineraryPlanStore,
-)
 from travel_agent_agent.infrastructure.memory_client import create_bailian_memory_client
 from travel_agent_agent.infrastructure.visa_client import create_visa_client
 from travel_agent_agent.intent.runtime import create_intent_runtime
@@ -63,7 +59,6 @@ def create_app(
     settings: Settings | None = None,
     checkpoint_store: RunCheckpointStore | None = None,
     interaction_store: PendingInteractionStore | None = None,
-    itinerary_plan_store: ItineraryPlanStore | InMemoryItineraryPlanStore | None = None,
 ) -> FastAPI:
     """创建带内部网关与真实只读配置、关联审计和安全错误信封的 Agent 应用。"""
     application_settings = settings or Settings.from_environment()
@@ -83,21 +78,6 @@ def create_app(
             client=Redis.from_url(application_settings.redis_url, decode_responses=True),
             ttl_seconds=application_settings.hitl_token_ttl_seconds,
         )
-    if itinerary_plan_store is not None:
-        application.state.itinerary_plan_store = itinerary_plan_store
-    elif checkpoint_store is not None:
-        application.state.itinerary_plan_store = InMemoryItineraryPlanStore()
-    else:
-        try:
-            application.state.itinerary_plan_store = ItineraryPlanStore.from_secret_file(
-                Redis.from_url(application_settings.redis_url, decode_responses=True),
-                application_settings.data_encryption_key_file,
-            )
-        except ValueError:
-            # 未启用真实 Provider 的本地单元测试可使用内存替身；真实运行必须有 Secret。
-            if application_settings.provider_call_enabled:
-                raise
-            application.state.itinerary_plan_store = InMemoryItineraryPlanStore()
     application.state.run_registry = RunExecutionRegistry()
     if checkpoint_store is not None:
         interrupt_transport: InterruptTransport = NullInterruptTransport()
@@ -222,9 +202,6 @@ def create_app(
             """在服务停止时关闭自建 Redis 连接池，不关闭测试注入的替身。"""
             store = application.state.checkpoint_store
             await store.close()
-            plan_store = application.state.itinerary_plan_store
-            if isinstance(plan_store, ItineraryPlanStore):
-                await plan_store.client.aclose()
             recommendation_client = getattr(application.state, "recommendation_redis", None)
             if recommendation_client is not None:
                 await recommendation_client.aclose()

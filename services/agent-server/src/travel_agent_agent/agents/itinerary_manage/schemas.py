@@ -25,7 +25,7 @@ class TravelOrderRecord(BaseModel):
 
 
 class SubmitTravelApprovalRecord(BaseModel):
-    """表示差旅单和审批单提交结果。"""
+    """表示差旅单和审批单提交结果；idempotent 为真表示直接返回了已存在的同行程申请。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -35,7 +35,6 @@ class SubmitTravelApprovalRecord(BaseModel):
     order_status: str
     approval_status: str | None = None
     idempotent: bool = False
-    verified: bool = False
     message: str = ""
 
 
@@ -84,12 +83,10 @@ class ModifyTravelOrderRecord(BaseModel):
 
 
 class TravelOrderInput(BaseModel):
-    """校验提交和修改共用的差旅字段。"""
+    """校验修改差旅单的差旅字段；提交走独立扁平参数，单号由服务端生成。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    # 提交差旅申请时可由服务端生成单号，因此允许省略；修改走独立工具参数。
-    order_id: str | None = Field(default=None, max_length=64)
     destination: str | None = Field(default=None, max_length=256)
     departure_city: str | None = Field(default=None, max_length=128)
     departure_date: date | str | None = None

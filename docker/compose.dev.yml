@@ -89,7 +89,6 @@ services:
       TRAVEL_AGENT_HITL_TOKEN_TTL_SECONDS: "900"
       API_AGENT_INTERNAL_TOKEN_FILE: /run/secrets/api_agent_internal_token
       AGENT_GATEWAY_INTERNAL_TOKEN_FILE: /run/secrets/agent_gateway_internal_token
-      TRAVEL_AGENT_DATA_ENCRYPTION_KEY_FILE: /run/secrets/data_encryption_key
       TRAVEL_AGENT_PROVIDER_KEY: dashscope
       TRAVEL_AGENT_PROVIDER_VERSION: intent-v1
       TRAVEL_AGENT_PROVIDER_BASE_URL: https://ws-afyh9lpghkjx1iz8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
@@ -125,7 +124,6 @@ services:
     secrets:
       - api_agent_internal_token
       - agent_gateway_internal_token
-      - data_encryption_key
       - tuniu_api_key
 
   tool-gateway:

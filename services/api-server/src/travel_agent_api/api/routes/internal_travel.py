@@ -31,10 +31,9 @@ router = APIRouter(prefix="/internal/v1", tags=["internal-travel"])
 
 
 class TravelOrderPayload(BaseModel):
-    """校验差旅单创建所需的最小业务字段。"""
+    """校验差旅单创建与修改所需的最小业务字段；单号由服务端生成，不接受调用方指定。"""
 
     model_config = ConfigDict(extra="forbid")
-    order_id: str | None = Field(default=None, min_length=1, max_length=64)
     destination: str | None = Field(default=None, max_length=256)
     departure_city: str | None = Field(default=None, max_length=128)
     departure_date: date | None = None
@@ -251,18 +250,17 @@ async def submit_travel_order(
     x_hitl_interaction_id: str | None = Header(default=None),
     x_conversation_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """以幂等键和一次性确认凭证创建差旅单及审批单。"""
+    """以一次性确认凭证创建差旅单及审批单；相同出行要素已存在时直接返回已有单。"""
     if (
         payload.departure_date
         and payload.return_date
         and payload.return_date < payload.departure_date
     ):
         raise ServiceError("invalid_date_range", "返程日期不能早于出发日期", False, 422)
-    # 入库保留原始类型；确认校验单独用 JSON 模式导出（日期转 ISO 字符串）。
+    # 入库保留原始类型；确认指纹用 JSON 模式导出，键名必须与工具形参逐字一致。
     request_payload = payload.model_dump(exclude_none=True)
-    authorization_args = payload.model_dump(mode="json", exclude_none=True)
+    tool_args = payload.model_dump(mode="json", exclude_none=True)
     data = dict(request_payload)
-    data.pop("order_id", None)
     if not x_conversation_id:
         raise ServiceError("conversation_id_required", "缺少会话标识", False, 400)
     idempotency_key = await _consume_write_authorization(
@@ -272,18 +270,22 @@ async def submit_travel_order(
         interaction_id=x_hitl_interaction_id,
         conversation_id=x_conversation_id,
         tool_name="submit_travel_approval",
-        tool_args={"payload": authorization_args},
+        tool_args=tool_args,
     )
     if x_idempotency_key and x_idempotency_key != idempotency_key:
         raise ServiceError("idempotency_key_mismatch", "幂等键校验失败", False, 403)
-    # 单号面向用户展示：未显式传入时生成可读单号，确认交互标识只用于幂等与审计。
-    order_id = payload.order_id or f"order_{uuid4().hex[:16]}"
-    order = await _service(request).submit(
+    # 单号由服务端生成并面向用户展示；确认交互标识只用于幂等与审计。
+    order_id = f"order_{uuid4().hex[:16]}"
+    outcome = await _service(request).submit(
         user_id=identity["user_id"],
         payload=data,
         idempotency_key=order_id,
     )
-    return {"order": _order_payload(order), "status": "submitted"}
+    return {
+        "order": _order_payload(outcome.order),
+        "status": "submitted",
+        "duplicate": outcome.duplicate,
+    }
 
 
 @router.get("/travel-orders")
@@ -407,7 +409,6 @@ async def modify_travel_order(
     request_payload = payload.model_dump(exclude_none=True)
     authorization_args = payload.model_dump(mode="json", exclude_none=True)
     data = dict(request_payload)
-    data.pop("order_id", None)
     if not x_conversation_id:
         raise ServiceError("conversation_id_required", "缺少会话标识", False, 400)
     await _consume_write_authorization(

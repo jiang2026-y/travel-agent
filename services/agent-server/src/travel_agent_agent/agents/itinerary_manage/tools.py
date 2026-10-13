@@ -1,11 +1,13 @@
 # 文件职责：定义 ItineraryManageAgent 的差旅单、冲突、预订、政策和用户信息工具。
-# 每个工具只通过 TravelManageApiClient 调用 API Server，写操作要求确认凭证并保留幂等键。
+# 每个工具只通过 TravelManageApiClient 调用 API Server，写操作要求确认凭证并保留幂等键；
+# 定义 _require_text、_require_iso_date，用于写工具的必填与 ISO 日期校验。
 from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import date
 from typing import Any
-from uuid import uuid4
 
 from langchain_core.tools import StructuredTool
 
@@ -15,7 +17,10 @@ from travel_agent_agent.agents.common.session_context import (
     set_profile_status,
     set_travel_order_id,
 )
-from travel_agent_agent.agents.itinerary_manage.client import TravelManageApiClient
+from travel_agent_agent.agents.itinerary_manage.client import (
+    TravelManageApiClient,
+    TravelOrderToolError,
+)
 from travel_agent_agent.agents.itinerary_manage.date_normalizer import (
     TravelDateError,
     TravelDateNormalizer,
@@ -38,6 +43,33 @@ from travel_agent_agent.agents.itinerary_manage.schemas import (
 )
 
 _LOGGER = logging.getLogger("travel_agent_agent.tools.cache")
+_ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _require_text(value: str, label: str) -> str:
+    """校验写工具必填文本字段，缺失时抛出可展示的参数错误。"""
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise TravelOrderToolError("INVALID_PARAM", f"{label}不能为空，请先向用户确认后再提交。")
+    return text
+
+
+def _require_iso_date(value: str, label: str) -> str:
+    """校验日期为明确的 YYYY-MM-DD；不接受相对日期，避免与确认参数指纹不一致。"""
+    text = value.strip() if isinstance(value, str) else ""
+    if not _ISO_DATE_PATTERN.fullmatch(text):
+        raise TravelOrderToolError(
+            "INVALID_DATE",
+            f"{label}格式不正确，必须为 YYYY-MM-DD（如 2026-09-18），"
+            "请先按当前日期换算出明确日期后再提交。",
+        )
+    try:
+        date.fromisoformat(text)
+    except ValueError as error:
+        raise TravelOrderToolError(
+            "INVALID_DATE", f"{label}不是有效日期，请核对后重试。"
+        ) from error
+    return text
 
 
 class TravelOrderWriteTools:
@@ -45,58 +77,81 @@ class TravelOrderWriteTools:
 
     def __init__(self, client: TravelManageApiClient) -> None:
         self.client = client
-        self.dates = TravelDateNormalizer()
 
-    async def submit_travel_approval(self, payload: TravelOrderInput) -> SubmitTravelApprovalRecord:
-        """提交差旅单和审批单；未提供单号时由服务端生成，幂等键取自确认交互。"""
-        order_id = payload.order_id or f"order_{uuid4().hex[:16]}"
-        normalized = self._normalize_dates(payload.model_dump(exclude_none=True))
-        # 单号由服务端按幂等键生成，请求体里不补字段，避免与确认时的参数指纹不一致。
-        normalized.pop("order_id", None)
-        existing = await self.client.request(
-            "GET", "/internal/v1/travel-orders", params={"order_id": order_id}
-        )
-        existing_orders = existing.get("orders", [])
-        if existing_orders:
-            order = existing_orders[0]
-            set_travel_order_id(order_id)
-            return SubmitTravelApprovalRecord(
-                success=True,
-                order_id=order.get("order_id", order_id),
-                approval_id=order.get("approval_id"),
-                order_status=order.get("status", "UNKNOWN"),
-                approval_status="PENDING",
-                idempotent=True,
-                verified=True,
-                message="差旅申请已存在，已返回原申请结果。",
+    async def submit_travel_approval(
+        self,
+        destination: str,
+        departure_city: str,
+        departure_date: str,
+        return_date: str,
+        purpose: str,
+    ) -> SubmitTravelApprovalRecord:
+        """提交差旅申请；单号由服务端生成，相同出行要素已存在时直接返回已有单。
+
+        请求体只包含五个出行要素的原值，不加任何额外字段，保证与确认卡片签发时的
+        参数指纹逐字一致；回查使用服务端返回的真实单号，验证失败即为硬失败。
+        """
+        body = {
+            "destination": _require_text(destination, "目的地"),
+            "departure_city": _require_text(departure_city, "出发城市"),
+            "departure_date": _require_iso_date(departure_date, "出发日期"),
+            "return_date": _require_iso_date(return_date, "返回日期"),
+            "purpose": _require_text(purpose, "出差事由"),
+        }
+        if body["return_date"] < body["departure_date"]:
+            raise TravelOrderToolError(
+                "INVALID_DATE_RANGE", "返程日期不能早于出发日期，请先修正日期后再提交。"
             )
         authorization = get_tool_execution_authorization()
         result = await self.client.request(
             "POST",
             "/internal/v1/travel-orders",
-            body=normalized,
+            body=body,
             confirmation_token=authorization.confirmation_token,
             interaction_id=authorization.interaction_id,
             idempotency_key=authorization.interaction_id,
         )
-        order = result.get("order", {})
+        order = result.get("order")
+        order = order if isinstance(order, dict) else {}
+        order_id = order.get("order_id")
+        if not isinstance(order_id, str) or not order_id:
+            raise TravelOrderToolError(
+                "VERIFY_FAILED", "提交结果缺少差旅单号，请稍后重试或联系管理员。"
+            )
+        duplicate = bool(result.get("duplicate"))
         set_travel_order_id(order_id)
         verification = await self.client.request(
             "GET",
             "/internal/v1/travel-orders",
             params={"order_id": order_id},
         )
-        verified_order = verification.get("orders", [])
-        verified = bool(verified_order) and verified_order[0].get("status") == "SUBMITTED"
+        verified_orders = verification.get("orders")
+        verified = (
+            isinstance(verified_orders, list)
+            and bool(verified_orders)
+            and isinstance(verified_orders[0], dict)
+            and verified_orders[0].get("status") == "SUBMITTED"
+        )
+        if not verified:
+            raise TravelOrderToolError(
+                "VERIFY_FAILED",
+                "操作已执行但验证失败：差旅单查询不到或状态与预期不符，"
+                "请如实告知用户并建议稍后重试或联系管理员。",
+            )
+        message = (
+            f"检测到相同出行信息的差旅申请已存在（差旅单号：{order_id}），已直接返回该申请，"
+            "未重复创建。"
+            if duplicate
+            else f"差旅申请已创建并提交审批，当前状态：待审批（差旅单号：{order_id}）。"
+        )
         return SubmitTravelApprovalRecord(
             success=result.get("status") == "submitted",
-            order_id=order.get("order_id", order_id),
+            order_id=order_id,
             approval_id=order.get("approval_id"),
             order_status=order.get("status", "UNKNOWN"),
             approval_status="PENDING",
-            idempotent=False,
-            verified=verified,
-            message="差旅申请已提交审批。",
+            idempotent=duplicate,
+            message=message,
         )
 
     async def cancel_travel_order(self, order_id: str) -> CancelTravelOrderRecord:
@@ -122,12 +177,23 @@ class TravelOrderWriteTools:
         self, order_id: str, payload: TravelOrderInput
     ) -> ModifyTravelOrderRecord:
         """修改差旅字段并由服务端撤销旧审批、创建新审批。"""
+        order_id = _require_text(order_id, "差旅单号")
+        body = payload.model_dump(exclude_none=True)
+        for field, label in (("departure_date", "出发日期"), ("return_date", "返回日期")):
+            value = body.get(field)
+            if value is None:
+                continue
+            if isinstance(value, date):
+                body[field] = value.isoformat()
+            else:
+                body[field] = _require_iso_date(
+                    value if isinstance(value, str) else str(value), label
+                )
         authorization = get_tool_execution_authorization()
-        normalized = self._normalize_dates(payload.model_dump(exclude_none=True))
         result = await self.client.request(
             "PATCH",
             f"/internal/v1/travel-orders/{order_id}",
-            body=normalized,
+            body=body,
             confirmation_token=authorization.confirmation_token,
             interaction_id=authorization.interaction_id,
             idempotency_key=authorization.interaction_id,
@@ -137,7 +203,7 @@ class TravelOrderWriteTools:
             success=result.get("status") == "resubmitted",
             order_id=order.get("order_id", order_id),
             new_approval_id=order.get("approval_id"),
-            updated_fields=list(payload.model_dump(exclude_none=True)),
+            updated_fields=list(body),
             message="差旅申请已更新并重新提交审批。",
         )
 
@@ -146,7 +212,12 @@ class TravelOrderWriteTools:
         return [
             StructuredTool.from_function(
                 coroutine=self.submit_travel_approval, name="submit_travel_approval",
-                description="提交差旅申请；必须先完成冲突检查并取得用户确认。",
+                description=(
+                    "提交差旅申请，参数为目的地、出发城市、出发日期、返回日期与出差事由；"
+                    "必须先完成冲突检查并取得用户确认；日期必须为 YYYY-MM-DD，不接受相对日期；"
+                    "不需要传单号，单号由系统生成后返回；相同出行要素的生效中申请已存在时"
+                    "直接返回该申请而不重复创建。"
+                ),
             ),
             StructuredTool.from_function(
                 coroutine=self.cancel_travel_order, name="cancel_travel_order",
@@ -158,21 +229,6 @@ class TravelOrderWriteTools:
                 description="修改差旅申请；必须先完成冲突检查并取得用户确认。",
             ),
         ]
-
-    def _normalize_dates(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """在工具调用前将相对日期转换为 API 只接受的 YYYY-MM-DD。"""
-        normalized = dict(payload)
-        departure = normalized.get("departure_date")
-        returning = normalized.get("return_date")
-        if isinstance(departure, str) and isinstance(returning, str):
-            date_range = self.dates.normalize_range(departure, returning)
-            normalized["departure_date"] = date_range.departure_date.isoformat()
-            normalized["return_date"] = date_range.return_date.isoformat()
-        elif isinstance(departure, str):
-            normalized["departure_date"] = self.dates.normalize(departure).isoformat()
-        elif isinstance(returning, str):
-            normalized["return_date"] = self.dates.normalize(returning).isoformat()
-        return normalized
 
 
 class TravelOrderConflictTools:

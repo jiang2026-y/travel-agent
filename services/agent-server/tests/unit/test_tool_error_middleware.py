@@ -11,7 +11,10 @@ from travel_agent_agent.agents.common.tool_errors import (
     build_tool_error_middleware,
     safe_tool_error_text,
 )
-from travel_agent_agent.agents.itinerary_manage.client import TravelManageApiError
+from travel_agent_agent.agents.itinerary_manage.client import (
+    TravelManageApiError,
+    TravelOrderToolError,
+)
 from travel_agent_agent.infrastructure.dashscope_client import DashScopeGatewayError
 from travel_agent_agent.infrastructure.tuniu_client import TuniuProviderError
 
@@ -40,6 +43,16 @@ def test_unknown_errors_and_unknown_codes_stay_safe() -> None:
     fallback = safe_tool_error_text(TravelManageApiError("travel_order_unknown_failure"))
     assert fallback is not None
     assert "travel_order_unknown_failure" not in fallback
+
+
+def test_travel_order_argument_and_verify_errors_are_visible_to_the_model() -> None:
+    """差旅参数错误与落库验证失败必须把中文说明原样回传给模型。"""
+    assert safe_tool_error_text(
+        TravelOrderToolError("INVALID_DATE", "出发日期格式不正确，必须为 YYYY-MM-DD。")
+    ) == "出发日期格式不正确，必须为 YYYY-MM-DD。"
+    assert safe_tool_error_text(
+        TravelOrderToolError("VERIFY_FAILED", "操作已执行但验证失败，请稍后重试。")
+    ) == "操作已执行但验证失败，请稍后重试。"
 
 
 def test_middleware_converts_known_errors_and_passes_through_the_rest() -> None:

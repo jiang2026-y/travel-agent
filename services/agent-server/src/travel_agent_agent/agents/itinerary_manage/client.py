@@ -1,5 +1,6 @@
 # 文件职责：封装 ItineraryManageAgent 到 API Server 内部差旅接口的安全调用。
-# 定义 TravelManageApiClient，并统一透传用户身份、确认凭证和四类关联标识。
+# 定义 TravelManageApiError、TravelOrderToolError 与 TravelManageApiClient，
+# 并统一透传用户身份、确认凭证和四类关联标识。
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,6 +22,16 @@ class TravelManageApiError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
+
+
+class TravelOrderToolError(RuntimeError):
+    """表示差旅写工具在调用后端前即可判定的参数错误或落库后的验证失败。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        """保存稳定错误码与可直接展示给模型的中文说明。"""
+        super().__init__(code)
+        self.code = code
+        self.message = message
 
 
 class TravelManageApiClient:

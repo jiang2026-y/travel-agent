@@ -1492,7 +1492,6 @@ name = "travel-agent-agent"
 version = "0.1.0"
 source = { editable = "services/agent-server" }
 dependencies = [
-    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain" },
@@ -1508,7 +1507,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", specifier = ">=44,<46" },
     { name = "fastapi", specifier = ">=0.135,<0.140" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "langchain", specifier = ">=1.3,<2" },
